@@ -36,9 +36,31 @@ Certifique-se de que você possui:
 ### Passo a Passo
 
 1. Clone este repositório:
-   ```bash
+   ```
    git clone https://github.com/brunoribas68/eye-tracking-project.git
    cd eye-tracking-project
+   
+2. Ative o ambiente virtual:
+
+     ```
+      python -m venv .venv
+      source .venv/bin/activate    # Linux/MacOS
+      .venv\Scripts\activate       # Windows
+     ```
+3. Instale as dependências:
+
+```
+pip install -r requirements.txt
+```
+
+4. Execute o projeto:
+```
+python main.py
+```
+
+Para sair do programa, pressione 'q'.
+
+
    
 ## 🤝 Contribuições
 ### Sinta-se à vontade para abrir uma issue ou enviar um pull request com melhorias ou correções!

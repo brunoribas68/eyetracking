@@ -49,3 +49,6 @@ while True:
 # Libera recursos
 webcam.release()
 cv2.destroyAllWindows()
+
+with open("eye_data.csv", "a") as file:
+    file.write(f"{gaze.horizontal_ratio()}, {gaze.vertical_ratio()}\n")
