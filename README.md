@@ -41,10 +41,10 @@ Certifique-se de que você possui:
    cd eye-tracking-project
    
 ## 🤝 Contribuições
-## Sinta-se à vontade para abrir uma issue ou enviar um pull request com melhorias ou correções!
+### Sinta-se à vontade para abrir uma issue ou enviar um pull request com melhorias ou correções!
 
 
 ## ✨ Créditos
-## Biblioteca de rastreamento ocular: GazeTracking.
+### Biblioteca de rastreamento ocular: GazeTracking.
 
-## Inspirado em projetos de análise de comportamento humano.
+### Inspirado em projetos de análise de comportamento humano.
