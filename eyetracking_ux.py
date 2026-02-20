@@ -70,6 +70,15 @@ class SessionConfig:
     gaze_overlay_mode: str
 
 
+@dataclass
+class ScreenCalibration:
+    left_x: float
+    right_x: float
+    top_y: float
+    bottom_y: float
+    corner_samples: dict[str, dict[str, float]]
+
+
 def ratio_between(v: float, a: float, b: float) -> float:
     lo, hi = min(a, b), max(a, b)
     if math.isclose(hi, lo):
@@ -382,6 +391,101 @@ def run_precalibration_check(
     return calibrated_threshold
 
 
+def map_gaze_with_calibration(gaze_x: float, gaze_y: float, calibration: Optional[ScreenCalibration]) -> tuple[float, float]:
+    if calibration is None:
+        return gaze_x, gaze_y
+    x_den = calibration.right_x - calibration.left_x
+    y_den = calibration.bottom_y - calibration.top_y
+    if math.isclose(x_den, 0.0) or math.isclose(y_den, 0.0):
+        return gaze_x, gaze_y
+    mapped_x = clip((gaze_x - calibration.left_x) / x_den)
+    mapped_y = clip((gaze_y - calibration.top_y) / y_den)
+    return mapped_x, mapped_y
+
+
+def run_corner_training(
+    cap,
+    backend,
+    cv2_module,
+    blink_ear_threshold: float,
+    seconds_per_corner: float,
+) -> Optional[ScreenCalibration]:
+    corners = [
+        ("top_right", 0.90, 0.10, "Olhe para o canto SUPERIOR DIREITO"),
+        ("bottom_right", 0.90, 0.90, "Olhe para o canto INFERIOR DIREITO"),
+        ("top_left", 0.10, 0.10, "Olhe para o canto SUPERIOR ESQUERDO"),
+        ("bottom_left", 0.10, 0.90, "Olhe para o canto INFERIOR ESQUERDO"),
+    ]
+    print("\n[Treinamento] Iniciando calibração por cantos da tela...")
+    print("[Treinamento] Sequência: superior direito -> inferior direito -> superior esquerdo -> inferior esquerdo.")
+
+    samples: dict[str, dict[str, list[float]]] = {
+        name: {"x": [], "y": []} for name, _, _, _ in corners
+    }
+
+    for name, tx, ty, instruction in corners:
+        phase_start = time.perf_counter()
+        while True:
+            elapsed = time.perf_counter() - phase_start
+            if elapsed >= seconds_per_corner:
+                break
+
+            ok, frame = cap.read()
+            if not ok:
+                continue
+
+            sample = backend.process(frame, cv2_module, blink_ear_threshold)
+            if sample is not None and not sample.blink:
+                samples[name]["x"].append(sample.gaze_x)
+                samples[name]["y"].append(sample.gaze_y)
+
+            h, w = frame.shape[:2]
+            cv2_module.putText(frame, "Treinamento de tela", (20, 30), cv2_module.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2_module.putText(frame, instruction, (20, 60), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            cv2_module.putText(frame, f"Tempo restante: {max(0.0, seconds_per_corner - elapsed):.1f}s", (20, 90), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+            cv2_module.circle(frame, (int(tx * (w - 1)), int(ty * (h - 1))), 14, (0, 255, 0), -1)
+            cv2_module.imshow("Eye Tracking UX", frame)
+
+            gaze_screen = frame.copy()
+            gaze_screen[:] = 20
+            cv2_module.putText(gaze_screen, "Gaze Screen (training)", (20, 30), cv2_module.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            sh, sw = gaze_screen.shape[:2]
+            cv2_module.circle(gaze_screen, (int(tx * (sw - 1)), int(ty * (sh - 1))), 14, (0, 255, 0), -1)
+            cv2_module.imshow("Eye Tracking UX - Gaze Screen", gaze_screen)
+
+            key = cv2_module.waitKey(1) & 0xFF
+            if key in {ord("q"), 27}:
+                print("[Treinamento] Treinamento interrompido pelo usuário.")
+                return None
+
+    corner_stats: dict[str, dict[str, float]] = {}
+    for name, _, _, _ in corners:
+        x_med = percentile(samples[name]["x"], 0.5)
+        y_med = percentile(samples[name]["y"], 0.5)
+        if math.isnan(x_med) or math.isnan(y_med):
+            print(f"[Treinamento] Falha: amostras insuficientes no canto '{name}'.")
+            return None
+        corner_stats[name] = {"gaze_x": x_med, "gaze_y": y_med}
+
+    left_x = safe_mean([corner_stats["top_left"]["gaze_x"], corner_stats["bottom_left"]["gaze_x"]])
+    right_x = safe_mean([corner_stats["top_right"]["gaze_x"], corner_stats["bottom_right"]["gaze_x"]])
+    top_y = safe_mean([corner_stats["top_left"]["gaze_y"], corner_stats["top_right"]["gaze_y"]])
+    bottom_y = safe_mean([corner_stats["bottom_left"]["gaze_y"], corner_stats["bottom_right"]["gaze_y"]])
+
+    if math.isclose(left_x, right_x) or math.isclose(top_y, bottom_y):
+        print("[Treinamento] Falha: calibração degenerada (faixa de olhos muito pequena).")
+        return None
+
+    print("[Treinamento] Calibração concluída com sucesso.")
+    return ScreenCalibration(
+        left_x=left_x,
+        right_x=right_x,
+        top_y=top_y,
+        bottom_y=bottom_y,
+        corner_samples=corner_stats,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eye tracking por webcam para UX")
     parser.add_argument("--camera-index", type=int, default=0)
@@ -409,15 +513,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--gaze-gain-x",
         type=float,
-        default=2.2,
+        default=1.0,
         help="Ganho horizontal do ponto de olhar projetado na tela (1.0 = sem ganho).",
     )
     parser.add_argument(
         "--gaze-gain-y",
         type=float,
-        default=2.0,
+        default=1.0,
         help="Ganho vertical do ponto de olhar projetado na tela (1.0 = sem ganho).",
     )
+    parser.add_argument("--skip-corner-training", action="store_true", help="Pula o treinamento de cantos da tela antes da coleta.")
+    parser.add_argument("--corner-seconds", type=float, default=2.0, help="Segundos de coleta por canto durante o treinamento.")
     return parser
 
 
@@ -455,6 +561,21 @@ def main() -> None:
         )
     print(f"Threshold de piscada em uso: {blink_ear_threshold:.3f}")
 
+    screen_calibration: Optional[ScreenCalibration] = None
+    if not args.skip_corner_training:
+        if not args.show_window:
+            print("[Treinamento] --show-window não habilitado. Pulando treinamento de cantos.")
+        else:
+            screen_calibration = run_corner_training(
+                cap,
+                backend,
+                cv2,
+                blink_ear_threshold,
+                max(args.corner_seconds, 0.5),
+            )
+            if screen_calibration is None:
+                print("[Treinamento] Calibração não concluída; usando mapeamento padrão.")
+
     frame_rows: list[dict] = []
     fixation_rows: list[dict] = []
     fix_state = FixationState()
@@ -491,8 +612,9 @@ def main() -> None:
             fixation_id = -1
 
             if sample is not None:
-                gaze_x = apply_gaze_gain(sample.gaze_x, max(args.gaze_gain_x, 0.1))
-                gaze_y = apply_gaze_gain(sample.gaze_y, max(args.gaze_gain_y, 0.1))
+                mapped_x, mapped_y = map_gaze_with_calibration(sample.gaze_x, sample.gaze_y, screen_calibration)
+                gaze_x = apply_gaze_gain(mapped_x, max(args.gaze_gain_x, 0.1))
+                gaze_y = apply_gaze_gain(mapped_y, max(args.gaze_gain_y, 0.1))
                 blink = sample.blink
                 left_ear = sample.left_ear
                 right_ear = sample.right_ear
@@ -634,6 +756,15 @@ def main() -> None:
             "display_target": session_config.training_display_target,
             "overlay_mode": session_config.gaze_overlay_mode,
             "next_step": "Integrar render em tela secundária/fluxo remoto para testes de UX.",
+        },
+        "screen_calibration": None
+        if screen_calibration is None
+        else {
+            "left_x": screen_calibration.left_x,
+            "right_x": screen_calibration.right_x,
+            "top_y": screen_calibration.top_y,
+            "bottom_y": screen_calibration.bottom_y,
+            "corners": screen_calibration.corner_samples,
         },
     }
     session_path.write_text(json.dumps(session_summary, indent=2, ensure_ascii=False), encoding="utf-8")
