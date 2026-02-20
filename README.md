@@ -41,8 +41,9 @@ Parâmetros úteis:
 - `--fixation-threshold-px 60`
 - `--fixation-min-duration-ms 180`
 - `--blink-ear-threshold 0.21`
+- `--max-duration-sec 30` (para parar automaticamente e salvar)
 
-Pressione `q` para encerrar.
+Pressione `q` para encerrar e salvar, ou use `Ctrl+C` no terminal (também salva).
 
 ## Saídas
 
