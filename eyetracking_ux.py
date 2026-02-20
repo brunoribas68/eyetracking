@@ -34,6 +34,12 @@ def safe_mean(values: list[float]) -> float:
     return sum(values) / len(values)
 
 
+def apply_gaze_gain(value: float, gain: float) -> float:
+    if math.isnan(value):
+        return value
+    return clip(0.5 + (value - 0.5) * gain)
+
+
 @dataclass
 class FixationState:
     fixation_id: int = 0
@@ -182,8 +188,8 @@ class MediaPipeBackend:
         right_ear = self.eye_aspect_ratio(right_top, right_bottom, right_inner, right_outer)
         avg_ear = (left_ear + right_ear) / 2.0
 
-        overlay_x = (left_iris_center[0] + right_iris_center[0]) / 2.0
-        overlay_y = (left_iris_center[1] + right_iris_center[1]) / 2.0
+        overlay_x = right_iris_center[0]
+        overlay_y = right_iris_center[1]
         return GazeSample(gaze_x, gaze_y, overlay_x, overlay_y, avg_ear < blink_ear_threshold, left_ear, right_ear, avg_ear)
 
     def close(self) -> None:
@@ -274,7 +280,7 @@ class OpenCVBackend:
 
         gaze_x = clip(safe_mean(x_ratios))
         gaze_y = clip(safe_mean(y_ratios))
-        overlay_x, overlay_y = centroid(overlay_points)
+        overlay_x, overlay_y = min(overlay_points, key=lambda p: p[1])
         avg_ear = safe_mean(ears)
         left_ear = ears[0] if len(ears) > 0 else float("nan")
         right_ear = ears[1] if len(ears) > 1 else float("nan")
@@ -400,6 +406,18 @@ def build_parser() -> argparse.ArgumentParser:
         default="cursor",
         help="Estratégia base para visualização de treino/UX (cursor atual ou base para heatmap).",
     )
+    parser.add_argument(
+        "--gaze-gain-x",
+        type=float,
+        default=2.2,
+        help="Ganho horizontal do ponto de olhar projetado na tela (1.0 = sem ganho).",
+    )
+    parser.add_argument(
+        "--gaze-gain-y",
+        type=float,
+        default=2.0,
+        help="Ganho vertical do ponto de olhar projetado na tela (1.0 = sem ganho).",
+    )
     return parser
 
 
@@ -473,8 +491,8 @@ def main() -> None:
             fixation_id = -1
 
             if sample is not None:
-                gaze_x = sample.gaze_x
-                gaze_y = sample.gaze_y
+                gaze_x = apply_gaze_gain(sample.gaze_x, max(args.gaze_gain_x, 0.1))
+                gaze_y = apply_gaze_gain(sample.gaze_y, max(args.gaze_gain_y, 0.1))
                 blink = sample.blink
                 left_ear = sample.left_ear
                 right_ear = sample.right_ear
@@ -493,6 +511,7 @@ def main() -> None:
 
                 if args.show_window and args.gaze_overlay_mode == "cursor":
                     cv2.circle(frame, (int(sample.overlay_x), int(sample.overlay_y)), 8, (0, 255, 0), -1)
+                    cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 6, (0, 255, 255), 2)
             elif args.show_window:
                 cv2.putText(frame, "Olhos nao detectados (ajuste luz/enquadramento)", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 

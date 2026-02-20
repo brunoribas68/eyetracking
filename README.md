@@ -47,6 +47,7 @@ Parâmetros úteis:
 - `--training-display-target main|secondary|remote` (prepara estratégia de exibição para treino/UX)
   - em `secondary|remote`, abre a janela extra `Eye Tracking UX - Gaze Screen` com o ponto de olhar projetado
 - `--gaze-overlay-mode cursor|heatmap_stub` (cursor atual ou modo base para heatmap)
+- `--gaze-gain-x 2.2` e `--gaze-gain-y 2.0` (aumenta sensibilidade do ponto na tela projetada; útil quando fica preso no centro)
 
 Pressione `q` para encerrar.
 
@@ -72,7 +73,7 @@ Se ainda ficar ruim no seu ambiente, rode com `--backend mediapipe` (quando disp
 Exemplo com janela principal + tela de gaze separada:
 
 ```bash
-python eyetracking_ux.py --output-dir runs/sessao_01 --show-window --training-display-target secondary
+python eyetracking_ux.py --output-dir runs/sessao_01 --show-window --training-display-target secondary --gaze-gain-x 2.4 --gaze-gain-y 2.2
 ```
 
 ## Saídas
