@@ -249,6 +249,89 @@ def write_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
             writer.writerow(row)
 
 
+def percentile(values: list[float], p: float) -> float:
+    if not values:
+        return float("nan")
+    ordered = sorted(values)
+    p = clip(p, 0.0, 1.0)
+    idx = int(round((len(ordered) - 1) * p))
+    return ordered[idx]
+
+
+def run_precalibration_check(
+    cap,
+    backend,
+    cv2_module,
+    seconds: float,
+    show_window: bool,
+    blink_ear_threshold: float,
+) -> float:
+    print("\n[Pré-calibragem] Iniciando validação de câmera/piscada...")
+    print("- Primeiro mantenha os olhos abertos.")
+    print("- Depois pisque naturalmente por alguns segundos.\n")
+
+    start = time.perf_counter()
+    open_phase = max(seconds * 0.5, 0.1)
+    open_ears: list[float] = []
+    blink_ears: list[float] = []
+    frames_seen = 0
+    frames_with_face = 0
+
+    while True:
+        elapsed = time.perf_counter() - start
+        if elapsed >= seconds:
+            break
+
+        ok, frame = cap.read()
+        if not ok:
+            continue
+        frames_seen += 1
+
+        sample = backend.process(frame, cv2_module, blink_ear_threshold)
+        phase_open = elapsed < open_phase
+        phase_text = "Olhos abertos" if phase_open else "Piscar natural"
+
+        if sample is not None and not math.isnan(sample.avg_ear):
+            frames_with_face += 1
+            if phase_open:
+                open_ears.append(sample.avg_ear)
+            else:
+                blink_ears.append(sample.avg_ear)
+
+        if show_window:
+            cv2_module.putText(frame, "Pre-calibragem", (20, 30), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2_module.putText(frame, phase_text, (20, 60), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+            if sample is not None and not math.isnan(sample.avg_ear):
+                cv2_module.putText(frame, f"EAR: {sample.avg_ear:.3f}", (20, 90), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            else:
+                cv2_module.putText(frame, "Rosto/olhos nao detectados", (20, 90), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+            cv2_module.imshow("Eye Tracking UX", frame)
+            if cv2_module.waitKey(1) & 0xFF == ord("q"):
+                break
+
+    coverage = 0.0 if frames_seen == 0 else frames_with_face / frames_seen
+    open_median = percentile(open_ears, 0.5)
+    blink_low = percentile(blink_ears, 0.2)
+
+    calibrated_threshold = blink_ear_threshold
+    if not math.isnan(open_median) and not math.isnan(blink_low) and open_median > blink_low:
+        calibrated_threshold = (open_median + blink_low) / 2.0
+
+    print(f"[Pré-calibragem] Cobertura de detecção: {coverage * 100:.1f}% ({frames_with_face}/{frames_seen}).")
+    if coverage < 0.6:
+        print("[Pré-calibragem] Atenção: detecção baixa. Melhore iluminação e enquadramento antes de calibrar.")
+    if math.isnan(open_median) or math.isnan(blink_low):
+        print("[Pré-calibragem] Amostras insuficientes para ajustar EAR. Mantendo threshold atual.")
+    else:
+        print(
+            f"[Pré-calibragem] EAR aberto mediano={open_median:.3f}, EAR baixo de piscada={blink_low:.3f}, "
+            f"novo threshold={calibrated_threshold:.3f}."
+        )
+
+    return calibrated_threshold
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eye tracking por webcam para UX")
     parser.add_argument("--camera-index", type=int, default=0)
@@ -258,6 +341,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fixation-threshold-px", type=float, default=60.0)
     parser.add_argument("--fixation-min-duration-ms", type=float, default=180.0)
     parser.add_argument("--blink-ear-threshold", type=float, default=0.21)
+    parser.add_argument("--precheck-seconds", type=float, default=8.0)
+    parser.add_argument("--skip-precheck", action="store_true")
     return parser
 
 
@@ -283,6 +368,18 @@ def main() -> None:
     backend, backend_name = choose_backend(args.backend, cv2)
     print(f"Backend selecionado: {backend_name}")
 
+    blink_ear_threshold = args.blink_ear_threshold
+    if not args.skip_precheck and args.precheck_seconds > 0:
+        blink_ear_threshold = run_precalibration_check(
+            cap,
+            backend,
+            cv2,
+            args.precheck_seconds,
+            args.show_window,
+            blink_ear_threshold,
+        )
+    print(f"Threshold de piscada em uso: {blink_ear_threshold:.3f}")
+
     frame_rows: list[dict] = []
     fixation_rows: list[dict] = []
     fix_state = FixationState()
@@ -297,7 +394,7 @@ def main() -> None:
 
         h, w = frame.shape[:2]
         timestamp_ms = (time.perf_counter() - t0) * 1000.0
-        sample = backend.process(frame, cv2, args.blink_ear_threshold)
+        sample = backend.process(frame, cv2, blink_ear_threshold)
 
         gaze_x = float("nan")
         gaze_y = float("nan")

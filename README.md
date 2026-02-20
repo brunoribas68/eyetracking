@@ -41,8 +41,19 @@ Parâmetros úteis:
 - `--fixation-threshold-px 60`
 - `--fixation-min-duration-ms 180`
 - `--blink-ear-threshold 0.21`
+- `--precheck-seconds 8` (etapa antes da calibragem para validar detecção e ajustar EAR)
+- `--skip-precheck` (pula essa etapa)
 
 Pressione `q` para encerrar.
+
+## Pré-calibragem (novo)
+
+Antes da coleta principal, o app roda uma etapa curta para melhorar a detecção de piscada:
+
+1. Metade do tempo: mantenha os olhos abertos.
+2. Metade do tempo: pisque naturalmente.
+
+Com isso, o sistema calcula um `blink-ear-threshold` mais adequado para sua câmera/iluminação e também informa a cobertura de detecção de rosto/olhos.
 
 ## Saídas
 
