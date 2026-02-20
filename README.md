@@ -43,8 +43,20 @@ Parâmetros úteis:
 - `--blink-ear-threshold 0.21`
 - `--precheck-seconds 8` (etapa antes da calibragem para validar detecção e ajustar EAR)
 - `--skip-precheck` (pula essa etapa)
+- `--max-session-seconds 120` (para automaticamente após N segundos e salva tudo)
+- `--training-display-target main|secondary|remote` (prepara estratégia de exibição para treino/UX)
+  - em `secondary|remote`, abre a janela extra `Eye Tracking UX - Gaze Screen` com o ponto de olhar projetado
+- `--gaze-overlay-mode cursor|heatmap_stub` (cursor atual ou modo base para heatmap)
+- `--gaze-gain-x 1.0` e `--gaze-gain-y 1.0` (aumenta sensibilidade do ponto na tela projetada; útil quando fica preso no centro)
+- `--skip-corner-training` (pula o treinamento de cantos da tela)
+- `--corner-seconds 3.0` (tempo por ponto no treinamento)
+- `--corner-settle-seconds 0.8` (tempo para estabilizar olhar antes de coletar em cada ponto)
+- `--corner-transition-seconds 0.8` (pausa entre um teste e outro)
+- `--training-pattern corners|extended` (somente 4 cantos ou treino estendido com pontos extras)
 
 Pressione `q` para encerrar.
+
+Também é possível interromper com `Ctrl+C` que a sessão parcial será salva.
 
 ## Pré-calibragem (novo)
 
@@ -55,7 +67,43 @@ Antes da coleta principal, o app roda uma etapa curta para melhorar a detecção
 
 Com isso, o sistema calcula um `blink-ear-threshold` mais adequado para sua câmera/iluminação e também informa a cobertura de detecção de rosto/olhos.
 
+## Treinamento por cantos da tela (novo)
+
+Antes da coleta principal (se não usar `--skip-corner-training`), o app pede para olhar nesta ordem (modo `corners`):
+
+1. canto superior esquerdo
+2. canto inferior esquerdo
+3. canto superior direito
+4. canto inferior direito
+
+Com esse treinamento, o sistema aprende os limites do seu olhar para mapear melhor para a tela de projeção.
+
+No modo `extended`, ele também adiciona centro, meio esquerdo/direito e meio superior/inferior para melhorar precisão fora dos cantos.
+
+## Precisão do ponto verde (melhoria)
+
+O cursor verde agora usa a posição estimada da pupila/íris detectada no frame (não apenas o `gaze_x/gaze_y` normalizado), o que reduz casos em que o ponto “escapa” para bochecha/rosto.
+
+No backend `opencv`, foi adicionado um filtro de qualidade para descartar caixas de olho improváveis (posição e proporção), reduzindo falsos positivos.
+
+Se ainda ficar ruim no seu ambiente, rode com `--backend mediapipe` (quando disponível), que tende a ser mais robusto.
+
+Exemplo com janela principal + tela de gaze separada:
+
+```bash
+python eyetracking_ux.py --output-dir runs/sessao_01 --show-window --training-display-target secondary --corner-seconds 3.0 --corner-settle-seconds 0.8 --corner-transition-seconds 1.0 --training-pattern extended --gaze-gain-x 1.2 --gaze-gain-y 1.2
+```
+
 ## Saídas
+
+### `session.json`
+
+Resumo da sessão com:
+
+- motivo de parada (`stop_reason`)
+- backend utilizado
+- quantidade de frames/fixações
+- configuração de treino para próximos passos de UX (tela principal/secundária/remoto)
 
 ### `frames.csv`
 

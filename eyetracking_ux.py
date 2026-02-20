@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -33,6 +34,12 @@ def safe_mean(values: list[float]) -> float:
     return sum(values) / len(values)
 
 
+def apply_gaze_gain(value: float, gain: float) -> float:
+    if math.isnan(value):
+        return value
+    return clip(0.5 + (value - 0.5) * gain)
+
+
 @dataclass
 class FixationState:
     fixation_id: int = 0
@@ -49,10 +56,27 @@ class FixationState:
 class GazeSample:
     gaze_x: float
     gaze_y: float
+    overlay_x: float
+    overlay_y: float
     blink: bool
     left_ear: float
     right_ear: float
     avg_ear: float
+
+
+@dataclass
+class SessionConfig:
+    training_display_target: str
+    gaze_overlay_mode: str
+
+
+@dataclass
+class ScreenCalibration:
+    left_x: float
+    right_x: float
+    top_y: float
+    bottom_y: float
+    corner_samples: dict[str, dict[str, float]]
 
 
 def ratio_between(v: float, a: float, b: float) -> float:
@@ -173,7 +197,9 @@ class MediaPipeBackend:
         right_ear = self.eye_aspect_ratio(right_top, right_bottom, right_inner, right_outer)
         avg_ear = (left_ear + right_ear) / 2.0
 
-        return GazeSample(gaze_x, gaze_y, avg_ear < blink_ear_threshold, left_ear, right_ear, avg_ear)
+        overlay_x = right_iris_center[0]
+        overlay_y = right_iris_center[1]
+        return GazeSample(gaze_x, gaze_y, overlay_x, overlay_y, avg_ear < blink_ear_threshold, left_ear, right_ear, avg_ear)
 
     def close(self) -> None:
         self.face_mesh.close()
@@ -188,6 +214,21 @@ class OpenCVBackend:
         self.eyes = cv2_module.CascadeClassifier(
             cv2_module.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
         )
+
+    @staticmethod
+    def _is_reasonable_eye(ex: int, ey: int, ew: int, eh: int, roi_w: int, roi_h: int) -> bool:
+        if ew <= 0 or eh <= 0:
+            return False
+        aspect = eh / max(ew, 1)
+        center_x = ex + ew / 2.0
+        center_y = ey + eh / 2.0
+        if not (0.12 <= aspect <= 0.9):
+            return False
+        if center_y > roi_h * 0.72:
+            return False
+        if center_x < roi_w * 0.08 or center_x > roi_w * 0.92:
+            return False
+        return True
 
     def _pupil_ratio(self, gray_eye) -> tuple[float, float]:
         blur = self.cv2.GaussianBlur(gray_eye, (7, 7), 0)
@@ -208,14 +249,30 @@ class OpenCVBackend:
 
         x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
         roi = gray[y:y + int(h * 0.6), x:x + w]
-        eyes = self.eyes.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=6, minSize=(20, 20))
+        eyes = self.eyes.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20))
         if len(eyes) < 1:
             return None
 
-        selected = sorted(eyes, key=lambda r: r[2] * r[3], reverse=True)[:2]
+        filtered_eyes = [e for e in eyes if self._is_reasonable_eye(e[0], e[1], e[2], e[3], w, roi.shape[0])]
+        eye_candidates = filtered_eyes if len(filtered_eyes) > 0 else list(eyes)
+
+        selected = sorted(eye_candidates, key=lambda r: r[2] * r[3], reverse=True)
+        if len(selected) >= 2:
+            leftmost = min(selected, key=lambda r: r[0])
+            rightmost = max(selected, key=lambda r: r[0])
+            horizontal_gap = abs((rightmost[0] + rightmost[2] / 2.0) - (leftmost[0] + leftmost[2] / 2.0))
+            min_gap = 0.18 * w
+            if horizontal_gap >= min_gap:
+                selected = [leftmost, rightmost]
+            else:
+                selected = [selected[0]]
+        else:
+            selected = selected[:1]
+
         x_ratios: list[float] = []
         y_ratios: list[float] = []
         ears: list[float] = []
+        overlay_points: list[tuple[float, float]] = []
 
         for ex, ey, ew, eh in selected:
             eye_roi = roi[ey:ey + eh, ex:ex + ew]
@@ -225,17 +282,19 @@ class OpenCVBackend:
             x_ratios.append(rx)
             y_ratios.append(ry)
             ears.append(eh / max(ew, 1))
+            overlay_points.append((x + ex + rx * ew, y + ey + ry * eh))
 
         if not x_ratios:
             return None
 
         gaze_x = clip(safe_mean(x_ratios))
         gaze_y = clip(safe_mean(y_ratios))
+        overlay_x, overlay_y = min(overlay_points, key=lambda p: p[1])
         avg_ear = safe_mean(ears)
         left_ear = ears[0] if len(ears) > 0 else float("nan")
         right_ear = ears[1] if len(ears) > 1 else float("nan")
         blink = (not math.isnan(avg_ear)) and (avg_ear < blink_ear_threshold)
-        return GazeSample(gaze_x, gaze_y, blink, left_ear, right_ear, avg_ear)
+        return GazeSample(gaze_x, gaze_y, overlay_x, overlay_y, blink, left_ear, right_ear, avg_ear)
 
     def close(self) -> None:
         return None
@@ -332,6 +391,139 @@ def run_precalibration_check(
     return calibrated_threshold
 
 
+def map_gaze_with_calibration(gaze_x: float, gaze_y: float, calibration: Optional[ScreenCalibration]) -> tuple[float, float]:
+    if calibration is None:
+        return gaze_x, gaze_y
+    x_den = calibration.right_x - calibration.left_x
+    y_den = calibration.bottom_y - calibration.top_y
+    if math.isclose(x_den, 0.0) or math.isclose(y_den, 0.0):
+        return gaze_x, gaze_y
+    mapped_x = clip((gaze_x - calibration.left_x) / x_den)
+    mapped_y = clip((gaze_y - calibration.top_y) / y_den)
+    return mapped_x, mapped_y
+
+
+def run_corner_training(
+    cap,
+    backend,
+    cv2_module,
+    blink_ear_threshold: float,
+    seconds_per_corner: float,
+    settle_seconds: float,
+    transition_seconds: float,
+    training_pattern: str,
+) -> Optional[ScreenCalibration]:
+    base_corners = [
+        ("top_left", 0.10, 0.10, "Teste 1: Olhe para o canto SUPERIOR ESQUERDO"),
+        ("bottom_left", 0.10, 0.90, "Teste 2: Olhe para o canto INFERIOR ESQUERDO"),
+        ("top_right", 0.90, 0.10, "Teste 3: Olhe para o canto SUPERIOR DIREITO"),
+        ("bottom_right", 0.90, 0.90, "Teste 4: Olhe para o canto INFERIOR DIREITO"),
+    ]
+    extended_points = [
+        ("center", 0.50, 0.50, "Teste extra: Olhe para o CENTRO"),
+        ("mid_left", 0.10, 0.50, "Teste extra: Olhe para o MEIO ESQUERDO"),
+        ("mid_right", 0.90, 0.50, "Teste extra: Olhe para o MEIO DIREITO"),
+        ("mid_top", 0.50, 0.10, "Teste extra: Olhe para o MEIO SUPERIOR"),
+        ("mid_bottom", 0.50, 0.90, "Teste extra: Olhe para o MEIO INFERIOR"),
+    ]
+    corners = list(base_corners)
+    if training_pattern == "extended":
+        corners.extend(extended_points)
+
+    print("\n[Treinamento] Iniciando calibração por pontos da tela...")
+    print("[Treinamento] Sequência base: superior esquerdo -> inferior esquerdo -> superior direito -> inferior direito.")
+    if training_pattern == "extended":
+        print("[Treinamento] Modo estendido habilitado com pontos extras (centro e meios).")
+
+    samples: dict[str, dict[str, list[float]]] = {
+        name: {"x": [], "y": []} for name, _, _, _ in corners
+    }
+
+    for idx, (name, tx, ty, instruction) in enumerate(corners):
+        phase_start = time.perf_counter()
+        while True:
+            elapsed = time.perf_counter() - phase_start
+            if elapsed >= seconds_per_corner:
+                break
+
+            ok, frame = cap.read()
+            if not ok:
+                continue
+
+            sample = backend.process(frame, cv2_module, blink_ear_threshold)
+            collecting = elapsed >= settle_seconds
+            if collecting and sample is not None and not sample.blink:
+                samples[name]["x"].append(sample.gaze_x)
+                samples[name]["y"].append(sample.gaze_y)
+
+            h, w = frame.shape[:2]
+            cv2_module.putText(frame, "Treinamento de tela", (20, 30), cv2_module.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+            cv2_module.putText(frame, instruction, (20, 60), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+            cv2_module.putText(frame, f"Tempo restante: {max(0.0, seconds_per_corner - elapsed):.1f}s", (20, 90), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+            phase_text = "Coletando amostras" if collecting else "Ajuste o olhar no alvo..."
+            phase_color = (0, 255, 0) if collecting else (0, 165, 255)
+            cv2_module.putText(frame, phase_text, (20, 120), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, phase_color, 2)
+            cv2_module.circle(frame, (int(tx * (w - 1)), int(ty * (h - 1))), 14, (0, 255, 0), -1)
+            cv2_module.imshow("Eye Tracking UX", frame)
+
+            gaze_screen = frame.copy()
+            gaze_screen[:] = 20
+            cv2_module.putText(gaze_screen, "Gaze Screen (training)", (20, 30), cv2_module.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            sh, sw = gaze_screen.shape[:2]
+            cv2_module.circle(gaze_screen, (int(tx * (sw - 1)), int(ty * (sh - 1))), 14, (0, 255, 0), -1)
+            cv2_module.imshow("Eye Tracking UX - Gaze Screen", gaze_screen)
+
+            key = cv2_module.waitKey(1) & 0xFF
+            if key in {ord("q"), 27}:
+                print("[Treinamento] Treinamento interrompido pelo usuário.")
+                return None
+
+        if idx < len(corners) - 1 and transition_seconds > 0:
+            pause_start = time.perf_counter()
+            while True:
+                pause_elapsed = time.perf_counter() - pause_start
+                if pause_elapsed >= transition_seconds:
+                    break
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                remaining = max(0.0, transition_seconds - pause_elapsed)
+                cv2_module.putText(frame, "Prepare-se para o próximo teste", (20, 60), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2_module.putText(frame, f"Próximo em: {remaining:.1f}s", (20, 90), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2_module.imshow("Eye Tracking UX", frame)
+                key = cv2_module.waitKey(1) & 0xFF
+                if key in {ord("q"), 27}:
+                    print("[Treinamento] Treinamento interrompido pelo usuário.")
+                    return None
+
+    corner_stats: dict[str, dict[str, float]] = {}
+    for name, _, _, _ in corners:
+        x_med = percentile(samples[name]["x"], 0.5)
+        y_med = percentile(samples[name]["y"], 0.5)
+        if math.isnan(x_med) or math.isnan(y_med):
+            print(f"[Treinamento] Falha: amostras insuficientes no canto '{name}'.")
+            return None
+        corner_stats[name] = {"gaze_x": x_med, "gaze_y": y_med}
+
+    left_x = safe_mean([corner_stats["top_left"]["gaze_x"], corner_stats["bottom_left"]["gaze_x"]])
+    right_x = safe_mean([corner_stats["top_right"]["gaze_x"], corner_stats["bottom_right"]["gaze_x"]])
+    top_y = safe_mean([corner_stats["top_left"]["gaze_y"], corner_stats["top_right"]["gaze_y"]])
+    bottom_y = safe_mean([corner_stats["bottom_left"]["gaze_y"], corner_stats["bottom_right"]["gaze_y"]])
+
+    if math.isclose(left_x, right_x) or math.isclose(top_y, bottom_y):
+        print("[Treinamento] Falha: calibração degenerada (faixa de olhos muito pequena).")
+        return None
+
+    print("[Treinamento] Calibração concluída com sucesso.")
+    return ScreenCalibration(
+        left_x=left_x,
+        right_x=right_x,
+        top_y=top_y,
+        bottom_y=bottom_y,
+        corner_samples=corner_stats,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eye tracking por webcam para UX")
     parser.add_argument("--camera-index", type=int, default=0)
@@ -343,6 +535,36 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blink-ear-threshold", type=float, default=0.21)
     parser.add_argument("--precheck-seconds", type=float, default=8.0)
     parser.add_argument("--skip-precheck", action="store_true")
+    parser.add_argument("--max-session-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--training-display-target",
+        choices=["main", "secondary", "remote"],
+        default="main",
+        help="Prepara o modo de treino para exibir olhar na tela principal, secundária ou fluxo remoto.",
+    )
+    parser.add_argument(
+        "--gaze-overlay-mode",
+        choices=["cursor", "heatmap_stub"],
+        default="cursor",
+        help="Estratégia base para visualização de treino/UX (cursor atual ou base para heatmap).",
+    )
+    parser.add_argument(
+        "--gaze-gain-x",
+        type=float,
+        default=1.0,
+        help="Ganho horizontal do ponto de olhar projetado na tela (1.0 = sem ganho).",
+    )
+    parser.add_argument(
+        "--gaze-gain-y",
+        type=float,
+        default=1.0,
+        help="Ganho vertical do ponto de olhar projetado na tela (1.0 = sem ganho).",
+    )
+    parser.add_argument("--skip-corner-training", action="store_true", help="Pula o treinamento de cantos da tela antes da coleta.")
+    parser.add_argument("--corner-seconds", type=float, default=3.0, help="Segundos por ponto durante o treinamento (inclui estabilização/coleta).")
+    parser.add_argument("--corner-settle-seconds", type=float, default=0.8, help="Tempo de estabilização antes de começar a coletar em cada ponto.")
+    parser.add_argument("--corner-transition-seconds", type=float, default=0.8, help="Pausa entre pontos do treinamento para reposicionar o olhar.")
+    parser.add_argument("--training-pattern", choices=["corners", "extended"], default="corners", help="Padrão de treinamento: apenas 4 cantos ou cantos + pontos extras.")
     return parser
 
 
@@ -380,75 +602,144 @@ def main() -> None:
         )
     print(f"Threshold de piscada em uso: {blink_ear_threshold:.3f}")
 
+    screen_calibration: Optional[ScreenCalibration] = None
+    if not args.skip_corner_training:
+        if not args.show_window:
+            print("[Treinamento] --show-window não habilitado. Pulando treinamento de cantos.")
+        else:
+            screen_calibration = run_corner_training(
+                cap,
+                backend,
+                cv2,
+                blink_ear_threshold,
+                max(args.corner_seconds, 1.0),
+                max(args.corner_settle_seconds, 0.0),
+                max(args.corner_transition_seconds, 0.0),
+                args.training_pattern,
+            )
+            if screen_calibration is None:
+                print("[Treinamento] Calibração não concluída; usando mapeamento padrão.")
+
     frame_rows: list[dict] = []
     fixation_rows: list[dict] = []
     fix_state = FixationState()
+    session_config = SessionConfig(
+        training_display_target=args.training_display_target,
+        gaze_overlay_mode=args.gaze_overlay_mode,
+    )
 
     frame_idx = 0
     t0 = time.perf_counter()
+    stop_reason = "camera_ended"
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        h, w = frame.shape[:2]
-        timestamp_ms = (time.perf_counter() - t0) * 1000.0
-        sample = backend.process(frame, cv2, blink_ear_threshold)
-
-        gaze_x = float("nan")
-        gaze_y = float("nan")
-        blink = False
-        left_ear = float("nan")
-        right_ear = float("nan")
-        avg_ear = float("nan")
-        fixation_id = -1
-
-        if sample is not None:
-            gaze_x = sample.gaze_x
-            gaze_y = sample.gaze_y
-            blink = sample.blink
-            left_ear = sample.left_ear
-            right_ear = sample.right_ear
-            avg_ear = sample.avg_ear
-
-            point_px = (gaze_x * w, gaze_y * h)
-            fixation_id, finalized = update_fixation(
-                fix_state,
-                point_px,
-                timestamp_ms,
-                args.fixation_threshold_px,
-                args.fixation_min_duration_ms,
-            )
-            if finalized is not None:
-                fixation_rows.append(finalized)
-
-            if args.show_window:
-                cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
-
-        frame_rows.append(
-            {
-                "frame_idx": frame_idx,
-                "timestamp_ms": timestamp_ms,
-                "gaze_x": gaze_x,
-                "gaze_y": gaze_y,
-                "blink": blink,
-                "left_ear": left_ear,
-                "right_ear": right_ear,
-                "avg_ear": avg_ear,
-                "fixation_id": fixation_id,
-                "backend": backend_name,
-            }
-        )
-
-        if args.show_window:
-            cv2.putText(frame, f"Backend: {backend_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(frame, f"Blink: {blink}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            cv2.imshow("Eye Tracking UX", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                stop_reason = "camera_ended"
                 break
 
-        frame_idx += 1
+            if args.max_session_seconds > 0 and (time.perf_counter() - t0) >= args.max_session_seconds:
+                stop_reason = "max_session_seconds"
+                break
+
+            h, w = frame.shape[:2]
+            timestamp_ms = (time.perf_counter() - t0) * 1000.0
+            sample = backend.process(frame, cv2, blink_ear_threshold)
+
+            gaze_x = float("nan")
+            gaze_y = float("nan")
+            blink = False
+            left_ear = float("nan")
+            right_ear = float("nan")
+            avg_ear = float("nan")
+            fixation_id = -1
+
+            if sample is not None:
+                mapped_x, mapped_y = map_gaze_with_calibration(sample.gaze_x, sample.gaze_y, screen_calibration)
+                gaze_x = apply_gaze_gain(mapped_x, max(args.gaze_gain_x, 0.1))
+                gaze_y = apply_gaze_gain(mapped_y, max(args.gaze_gain_y, 0.1))
+                blink = sample.blink
+                left_ear = sample.left_ear
+                right_ear = sample.right_ear
+                avg_ear = sample.avg_ear
+
+                point_px = (gaze_x * w, gaze_y * h)
+                fixation_id, finalized = update_fixation(
+                    fix_state,
+                    point_px,
+                    timestamp_ms,
+                    args.fixation_threshold_px,
+                    args.fixation_min_duration_ms,
+                )
+                if finalized is not None:
+                    fixation_rows.append(finalized)
+
+                if args.show_window and args.gaze_overlay_mode == "cursor":
+                    cv2.circle(frame, (int(sample.overlay_x), int(sample.overlay_y)), 8, (0, 255, 0), -1)
+                    cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 6, (0, 255, 255), 2)
+            elif args.show_window:
+                cv2.putText(frame, "Olhos nao detectados (ajuste luz/enquadramento)", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+            frame_rows.append(
+                {
+                    "frame_idx": frame_idx,
+                    "timestamp_ms": timestamp_ms,
+                    "gaze_x": gaze_x,
+                    "gaze_y": gaze_y,
+                    "blink": blink,
+                    "left_ear": left_ear,
+                    "right_ear": right_ear,
+                    "avg_ear": avg_ear,
+                    "fixation_id": fixation_id,
+                    "backend": backend_name,
+                }
+            )
+
+            if args.show_window:
+                cv2.putText(frame, f"Backend: {backend_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Blink: {blink}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                cv2.putText(
+                    frame,
+                    f"Target: {session_config.training_display_target}",
+                    (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.imshow("Eye Tracking UX", frame)
+
+                if session_config.training_display_target in {"secondary", "remote"}:
+                    gaze_screen = frame.copy()
+                    gaze_screen[:] = 20
+                    screen_h, screen_w = gaze_screen.shape[:2]
+                    cv2.putText(
+                        gaze_screen,
+                        f"Gaze Screen ({session_config.training_display_target})",
+                        (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.rectangle(gaze_screen, (0, 0), (screen_w - 1, screen_h - 1), (80, 80, 80), 2)
+                    if sample is not None:
+                        sx = int(clip(gaze_x) * (screen_w - 1))
+                        sy = int(clip(gaze_y) * (screen_h - 1))
+                        cv2.circle(gaze_screen, (sx, sy), 12, (0, 255, 0), -1)
+                    else:
+                        cv2.putText(gaze_screen, "Sem deteccao de olhar", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
+                    cv2.imshow("Eye Tracking UX - Gaze Screen", gaze_screen)
+                key = cv2.waitKey(1) & 0xFF
+                if key in {ord("q"), 27}:
+                    stop_reason = "user_requested_stop"
+                    break
+
+            frame_idx += 1
+    except KeyboardInterrupt:
+        stop_reason = "keyboard_interrupt"
+        print("\nInterrupção detectada. Salvando sessão parcial...")
 
     cap.release()
     backend.close()
@@ -474,6 +765,7 @@ def main() -> None:
 
     frames_path = args.output_dir / "frames.csv"
     fixations_path = args.output_dir / "fixations.csv"
+    session_path = args.output_dir / "session.json"
 
     write_csv(
         frames_path,
@@ -497,8 +789,33 @@ def main() -> None:
         ["fixation_id", "start_ms", "end_ms", "duration_ms", "centroid_x", "centroid_y", "samples"],
     )
 
+    session_summary = {
+        "status": "saved",
+        "stop_reason": stop_reason,
+        "backend": backend_name,
+        "blink_ear_threshold": blink_ear_threshold,
+        "total_frames": len(frame_rows),
+        "total_fixations": len(fixation_rows),
+        "training_prep": {
+            "display_target": session_config.training_display_target,
+            "overlay_mode": session_config.gaze_overlay_mode,
+            "next_step": "Integrar render em tela secundária/fluxo remoto para testes de UX.",
+        },
+        "screen_calibration": None
+        if screen_calibration is None
+        else {
+            "left_x": screen_calibration.left_x,
+            "right_x": screen_calibration.right_x,
+            "top_y": screen_calibration.top_y,
+            "bottom_y": screen_calibration.bottom_y,
+            "corners": screen_calibration.corner_samples,
+        },
+    }
+    session_path.write_text(json.dumps(session_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
     print(f"Frames salvos em: {frames_path}")
     print(f"Fixações salvas em: {fixations_path}")
+    print(f"Resumo da sessão salvo em: {session_path}")
 
 
 if __name__ == "__main__":
