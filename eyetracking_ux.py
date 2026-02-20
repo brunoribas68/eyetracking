@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -53,6 +54,12 @@ class GazeSample:
     left_ear: float
     right_ear: float
     avg_ear: float
+
+
+@dataclass
+class SessionConfig:
+    training_display_target: str
+    gaze_overlay_mode: str
 
 
 def ratio_between(v: float, a: float, b: float) -> float:
@@ -343,6 +350,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--blink-ear-threshold", type=float, default=0.21)
     parser.add_argument("--precheck-seconds", type=float, default=8.0)
     parser.add_argument("--skip-precheck", action="store_true")
+    parser.add_argument("--max-session-seconds", type=float, default=0.0)
+    parser.add_argument(
+        "--training-display-target",
+        choices=["main", "secondary", "remote"],
+        default="main",
+        help="Prepara o modo de treino para exibir olhar na tela principal, secundária ou fluxo remoto.",
+    )
+    parser.add_argument(
+        "--gaze-overlay-mode",
+        choices=["cursor", "heatmap_stub"],
+        default="cursor",
+        help="Estratégia base para visualização de treino/UX (cursor atual ou base para heatmap).",
+    )
     return parser
 
 
@@ -383,72 +403,97 @@ def main() -> None:
     frame_rows: list[dict] = []
     fixation_rows: list[dict] = []
     fix_state = FixationState()
+    session_config = SessionConfig(
+        training_display_target=args.training_display_target,
+        gaze_overlay_mode=args.gaze_overlay_mode,
+    )
 
     frame_idx = 0
     t0 = time.perf_counter()
+    stop_reason = "camera_ended"
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        h, w = frame.shape[:2]
-        timestamp_ms = (time.perf_counter() - t0) * 1000.0
-        sample = backend.process(frame, cv2, blink_ear_threshold)
-
-        gaze_x = float("nan")
-        gaze_y = float("nan")
-        blink = False
-        left_ear = float("nan")
-        right_ear = float("nan")
-        avg_ear = float("nan")
-        fixation_id = -1
-
-        if sample is not None:
-            gaze_x = sample.gaze_x
-            gaze_y = sample.gaze_y
-            blink = sample.blink
-            left_ear = sample.left_ear
-            right_ear = sample.right_ear
-            avg_ear = sample.avg_ear
-
-            point_px = (gaze_x * w, gaze_y * h)
-            fixation_id, finalized = update_fixation(
-                fix_state,
-                point_px,
-                timestamp_ms,
-                args.fixation_threshold_px,
-                args.fixation_min_duration_ms,
-            )
-            if finalized is not None:
-                fixation_rows.append(finalized)
-
-            if args.show_window:
-                cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
-
-        frame_rows.append(
-            {
-                "frame_idx": frame_idx,
-                "timestamp_ms": timestamp_ms,
-                "gaze_x": gaze_x,
-                "gaze_y": gaze_y,
-                "blink": blink,
-                "left_ear": left_ear,
-                "right_ear": right_ear,
-                "avg_ear": avg_ear,
-                "fixation_id": fixation_id,
-                "backend": backend_name,
-            }
-        )
-
-        if args.show_window:
-            cv2.putText(frame, f"Backend: {backend_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(frame, f"Blink: {blink}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            cv2.imshow("Eye Tracking UX", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                stop_reason = "camera_ended"
                 break
 
-        frame_idx += 1
+            if args.max_session_seconds > 0 and (time.perf_counter() - t0) >= args.max_session_seconds:
+                stop_reason = "max_session_seconds"
+                break
+
+            h, w = frame.shape[:2]
+            timestamp_ms = (time.perf_counter() - t0) * 1000.0
+            sample = backend.process(frame, cv2, blink_ear_threshold)
+
+            gaze_x = float("nan")
+            gaze_y = float("nan")
+            blink = False
+            left_ear = float("nan")
+            right_ear = float("nan")
+            avg_ear = float("nan")
+            fixation_id = -1
+
+            if sample is not None:
+                gaze_x = sample.gaze_x
+                gaze_y = sample.gaze_y
+                blink = sample.blink
+                left_ear = sample.left_ear
+                right_ear = sample.right_ear
+                avg_ear = sample.avg_ear
+
+                point_px = (gaze_x * w, gaze_y * h)
+                fixation_id, finalized = update_fixation(
+                    fix_state,
+                    point_px,
+                    timestamp_ms,
+                    args.fixation_threshold_px,
+                    args.fixation_min_duration_ms,
+                )
+                if finalized is not None:
+                    fixation_rows.append(finalized)
+
+                if args.show_window and args.gaze_overlay_mode == "cursor":
+                    cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
+
+            frame_rows.append(
+                {
+                    "frame_idx": frame_idx,
+                    "timestamp_ms": timestamp_ms,
+                    "gaze_x": gaze_x,
+                    "gaze_y": gaze_y,
+                    "blink": blink,
+                    "left_ear": left_ear,
+                    "right_ear": right_ear,
+                    "avg_ear": avg_ear,
+                    "fixation_id": fixation_id,
+                    "backend": backend_name,
+                }
+            )
+
+            if args.show_window:
+                cv2.putText(frame, f"Backend: {backend_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Blink: {blink}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                cv2.putText(
+                    frame,
+                    f"Target: {session_config.training_display_target}",
+                    (20, 90),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (255, 255, 255),
+                    2,
+                )
+                cv2.imshow("Eye Tracking UX", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in {ord("q"), 27}:
+                    stop_reason = "user_requested_stop"
+                    break
+
+            frame_idx += 1
+    except KeyboardInterrupt:
+        stop_reason = "keyboard_interrupt"
+        print("\nInterrupção detectada. Salvando sessão parcial...")
 
     cap.release()
     backend.close()
@@ -474,6 +519,7 @@ def main() -> None:
 
     frames_path = args.output_dir / "frames.csv"
     fixations_path = args.output_dir / "fixations.csv"
+    session_path = args.output_dir / "session.json"
 
     write_csv(
         frames_path,
@@ -497,8 +543,24 @@ def main() -> None:
         ["fixation_id", "start_ms", "end_ms", "duration_ms", "centroid_x", "centroid_y", "samples"],
     )
 
+    session_summary = {
+        "status": "saved",
+        "stop_reason": stop_reason,
+        "backend": backend_name,
+        "blink_ear_threshold": blink_ear_threshold,
+        "total_frames": len(frame_rows),
+        "total_fixations": len(fixation_rows),
+        "training_prep": {
+            "display_target": session_config.training_display_target,
+            "overlay_mode": session_config.gaze_overlay_mode,
+            "next_step": "Integrar render em tela secundária/fluxo remoto para testes de UX.",
+        },
+    }
+    session_path.write_text(json.dumps(session_summary, indent=2, ensure_ascii=False), encoding="utf-8")
+
     print(f"Frames salvos em: {frames_path}")
     print(f"Fixações salvas em: {fixations_path}")
+    print(f"Resumo da sessão salvo em: {session_path}")
 
 
 if __name__ == "__main__":

@@ -43,8 +43,13 @@ Parâmetros úteis:
 - `--blink-ear-threshold 0.21`
 - `--precheck-seconds 8` (etapa antes da calibragem para validar detecção e ajustar EAR)
 - `--skip-precheck` (pula essa etapa)
+- `--max-session-seconds 120` (para automaticamente após N segundos e salva tudo)
+- `--training-display-target main|secondary|remote` (prepara estratégia de exibição para treino/UX)
+- `--gaze-overlay-mode cursor|heatmap_stub` (cursor atual ou modo base para heatmap)
 
 Pressione `q` para encerrar.
+
+Também é possível interromper com `Ctrl+C` que a sessão parcial será salva.
 
 ## Pré-calibragem (novo)
 
@@ -56,6 +61,15 @@ Antes da coleta principal, o app roda uma etapa curta para melhorar a detecção
 Com isso, o sistema calcula um `blink-ear-threshold` mais adequado para sua câmera/iluminação e também informa a cobertura de detecção de rosto/olhos.
 
 ## Saídas
+
+### `session.json`
+
+Resumo da sessão com:
+
+- motivo de parada (`stop_reason`)
+- backend utilizado
+- quantidade de frames/fixações
+- configuração de treino para próximos passos de UX (tela principal/secundária/remoto)
 
 ### `frames.csv`
 
