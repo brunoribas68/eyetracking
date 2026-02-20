@@ -45,6 +45,7 @@ Parâmetros úteis:
 - `--skip-precheck` (pula essa etapa)
 - `--max-session-seconds 120` (para automaticamente após N segundos e salva tudo)
 - `--training-display-target main|secondary|remote` (prepara estratégia de exibição para treino/UX)
+  - em `secondary|remote`, abre a janela extra `Eye Tracking UX - Gaze Screen` com o ponto de olhar projetado
 - `--gaze-overlay-mode cursor|heatmap_stub` (cursor atual ou modo base para heatmap)
 
 Pressione `q` para encerrar.
@@ -67,6 +68,12 @@ O cursor verde agora usa a posição estimada da pupila/íris detectada no frame
 No backend `opencv`, foi adicionado um filtro de qualidade para descartar caixas de olho improváveis (posição e proporção), reduzindo falsos positivos.
 
 Se ainda ficar ruim no seu ambiente, rode com `--backend mediapipe` (quando disponível), que tende a ser mais robusto.
+
+Exemplo com janela principal + tela de gaze separada:
+
+```bash
+python eyetracking_ux.py --output-dir runs/sessao_01 --show-window --training-display-target secondary
+```
 
 ## Saídas
 

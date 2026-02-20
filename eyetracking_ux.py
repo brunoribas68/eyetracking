@@ -207,9 +207,9 @@ class OpenCVBackend:
         aspect = eh / max(ew, 1)
         center_x = ex + ew / 2.0
         center_y = ey + eh / 2.0
-        if not (0.18 <= aspect <= 0.75):
+        if not (0.12 <= aspect <= 0.9):
             return False
-        if center_y > roi_h * 0.62:
+        if center_y > roi_h * 0.72:
             return False
         if center_x < roi_w * 0.08 or center_x > roi_w * 0.92:
             return False
@@ -234,15 +234,14 @@ class OpenCVBackend:
 
         x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
         roi = gray[y:y + int(h * 0.6), x:x + w]
-        eyes = self.eyes.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=6, minSize=(20, 20))
+        eyes = self.eyes.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=4, minSize=(20, 20))
         if len(eyes) < 1:
             return None
 
         filtered_eyes = [e for e in eyes if self._is_reasonable_eye(e[0], e[1], e[2], e[3], w, roi.shape[0])]
-        if len(filtered_eyes) == 0:
-            return None
+        eye_candidates = filtered_eyes if len(filtered_eyes) > 0 else list(eyes)
 
-        selected = sorted(filtered_eyes, key=lambda r: r[2] * r[3], reverse=True)
+        selected = sorted(eye_candidates, key=lambda r: r[2] * r[3], reverse=True)
         if len(selected) >= 2:
             leftmost = min(selected, key=lambda r: r[0])
             rightmost = max(selected, key=lambda r: r[0])
@@ -494,6 +493,8 @@ def main() -> None:
 
                 if args.show_window and args.gaze_overlay_mode == "cursor":
                     cv2.circle(frame, (int(sample.overlay_x), int(sample.overlay_y)), 8, (0, 255, 0), -1)
+            elif args.show_window:
+                cv2.putText(frame, "Olhos nao detectados (ajuste luz/enquadramento)", (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
 
             frame_rows.append(
                 {
@@ -523,6 +524,28 @@ def main() -> None:
                     2,
                 )
                 cv2.imshow("Eye Tracking UX", frame)
+
+                if session_config.training_display_target in {"secondary", "remote"}:
+                    gaze_screen = frame.copy()
+                    gaze_screen[:] = 20
+                    screen_h, screen_w = gaze_screen.shape[:2]
+                    cv2.putText(
+                        gaze_screen,
+                        f"Gaze Screen ({session_config.training_display_target})",
+                        (20, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.8,
+                        (255, 255, 255),
+                        2,
+                    )
+                    cv2.rectangle(gaze_screen, (0, 0), (screen_w - 1, screen_h - 1), (80, 80, 80), 2)
+                    if sample is not None:
+                        sx = int(clip(gaze_x) * (screen_w - 1))
+                        sy = int(clip(gaze_y) * (screen_h - 1))
+                        cv2.circle(gaze_screen, (sx, sy), 12, (0, 255, 0), -1)
+                    else:
+                        cv2.putText(gaze_screen, "Sem deteccao de olhar", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 140, 255), 2)
+                    cv2.imshow("Eye Tracking UX - Gaze Screen", gaze_screen)
                 key = cv2.waitKey(1) & 0xFF
                 if key in {ord("q"), 27}:
                     stop_reason = "user_requested_stop"
