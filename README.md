@@ -60,6 +60,14 @@ Antes da coleta principal, o app roda uma etapa curta para melhorar a detecção
 
 Com isso, o sistema calcula um `blink-ear-threshold` mais adequado para sua câmera/iluminação e também informa a cobertura de detecção de rosto/olhos.
 
+## Precisão do ponto verde (melhoria)
+
+O cursor verde agora usa a posição estimada da pupila/íris detectada no frame (não apenas o `gaze_x/gaze_y` normalizado), o que reduz casos em que o ponto “escapa” para bochecha/rosto.
+
+No backend `opencv`, foi adicionado um filtro de qualidade para descartar caixas de olho improváveis (posição e proporção), reduzindo falsos positivos.
+
+Se ainda ficar ruim no seu ambiente, rode com `--backend mediapipe` (quando disponível), que tende a ser mais robusto.
+
 ## Saídas
 
 ### `session.json`

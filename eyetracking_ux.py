@@ -50,6 +50,8 @@ class FixationState:
 class GazeSample:
     gaze_x: float
     gaze_y: float
+    overlay_x: float
+    overlay_y: float
     blink: bool
     left_ear: float
     right_ear: float
@@ -180,7 +182,9 @@ class MediaPipeBackend:
         right_ear = self.eye_aspect_ratio(right_top, right_bottom, right_inner, right_outer)
         avg_ear = (left_ear + right_ear) / 2.0
 
-        return GazeSample(gaze_x, gaze_y, avg_ear < blink_ear_threshold, left_ear, right_ear, avg_ear)
+        overlay_x = (left_iris_center[0] + right_iris_center[0]) / 2.0
+        overlay_y = (left_iris_center[1] + right_iris_center[1]) / 2.0
+        return GazeSample(gaze_x, gaze_y, overlay_x, overlay_y, avg_ear < blink_ear_threshold, left_ear, right_ear, avg_ear)
 
     def close(self) -> None:
         self.face_mesh.close()
@@ -195,6 +199,21 @@ class OpenCVBackend:
         self.eyes = cv2_module.CascadeClassifier(
             cv2_module.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
         )
+
+    @staticmethod
+    def _is_reasonable_eye(ex: int, ey: int, ew: int, eh: int, roi_w: int, roi_h: int) -> bool:
+        if ew <= 0 or eh <= 0:
+            return False
+        aspect = eh / max(ew, 1)
+        center_x = ex + ew / 2.0
+        center_y = ey + eh / 2.0
+        if not (0.18 <= aspect <= 0.75):
+            return False
+        if center_y > roi_h * 0.62:
+            return False
+        if center_x < roi_w * 0.08 or center_x > roi_w * 0.92:
+            return False
+        return True
 
     def _pupil_ratio(self, gray_eye) -> tuple[float, float]:
         blur = self.cv2.GaussianBlur(gray_eye, (7, 7), 0)
@@ -219,10 +238,27 @@ class OpenCVBackend:
         if len(eyes) < 1:
             return None
 
-        selected = sorted(eyes, key=lambda r: r[2] * r[3], reverse=True)[:2]
+        filtered_eyes = [e for e in eyes if self._is_reasonable_eye(e[0], e[1], e[2], e[3], w, roi.shape[0])]
+        if len(filtered_eyes) == 0:
+            return None
+
+        selected = sorted(filtered_eyes, key=lambda r: r[2] * r[3], reverse=True)
+        if len(selected) >= 2:
+            leftmost = min(selected, key=lambda r: r[0])
+            rightmost = max(selected, key=lambda r: r[0])
+            horizontal_gap = abs((rightmost[0] + rightmost[2] / 2.0) - (leftmost[0] + leftmost[2] / 2.0))
+            min_gap = 0.18 * w
+            if horizontal_gap >= min_gap:
+                selected = [leftmost, rightmost]
+            else:
+                selected = [selected[0]]
+        else:
+            selected = selected[:1]
+
         x_ratios: list[float] = []
         y_ratios: list[float] = []
         ears: list[float] = []
+        overlay_points: list[tuple[float, float]] = []
 
         for ex, ey, ew, eh in selected:
             eye_roi = roi[ey:ey + eh, ex:ex + ew]
@@ -232,17 +268,19 @@ class OpenCVBackend:
             x_ratios.append(rx)
             y_ratios.append(ry)
             ears.append(eh / max(ew, 1))
+            overlay_points.append((x + ex + rx * ew, y + ey + ry * eh))
 
         if not x_ratios:
             return None
 
         gaze_x = clip(safe_mean(x_ratios))
         gaze_y = clip(safe_mean(y_ratios))
+        overlay_x, overlay_y = centroid(overlay_points)
         avg_ear = safe_mean(ears)
         left_ear = ears[0] if len(ears) > 0 else float("nan")
         right_ear = ears[1] if len(ears) > 1 else float("nan")
         blink = (not math.isnan(avg_ear)) and (avg_ear < blink_ear_threshold)
-        return GazeSample(gaze_x, gaze_y, blink, left_ear, right_ear, avg_ear)
+        return GazeSample(gaze_x, gaze_y, overlay_x, overlay_y, blink, left_ear, right_ear, avg_ear)
 
     def close(self) -> None:
         return None
@@ -455,7 +493,7 @@ def main() -> None:
                     fixation_rows.append(finalized)
 
                 if args.show_window and args.gaze_overlay_mode == "cursor":
-                    cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
+                    cv2.circle(frame, (int(sample.overlay_x), int(sample.overlay_y)), 8, (0, 255, 0), -1)
 
             frame_rows.append(
                 {
