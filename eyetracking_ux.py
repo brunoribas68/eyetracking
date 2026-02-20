@@ -409,21 +409,37 @@ def run_corner_training(
     cv2_module,
     blink_ear_threshold: float,
     seconds_per_corner: float,
+    settle_seconds: float,
+    transition_seconds: float,
+    training_pattern: str,
 ) -> Optional[ScreenCalibration]:
-    corners = [
+    base_corners = [
         ("top_left", 0.10, 0.10, "Teste 1: Olhe para o canto SUPERIOR ESQUERDO"),
         ("bottom_left", 0.10, 0.90, "Teste 2: Olhe para o canto INFERIOR ESQUERDO"),
         ("top_right", 0.90, 0.10, "Teste 3: Olhe para o canto SUPERIOR DIREITO"),
         ("bottom_right", 0.90, 0.90, "Teste 4: Olhe para o canto INFERIOR DIREITO"),
     ]
-    print("\n[Treinamento] Iniciando calibração por cantos da tela...")
-    print("[Treinamento] Sequência: superior esquerdo -> inferior esquerdo -> superior direito -> inferior direito.")
+    extended_points = [
+        ("center", 0.50, 0.50, "Teste extra: Olhe para o CENTRO"),
+        ("mid_left", 0.10, 0.50, "Teste extra: Olhe para o MEIO ESQUERDO"),
+        ("mid_right", 0.90, 0.50, "Teste extra: Olhe para o MEIO DIREITO"),
+        ("mid_top", 0.50, 0.10, "Teste extra: Olhe para o MEIO SUPERIOR"),
+        ("mid_bottom", 0.50, 0.90, "Teste extra: Olhe para o MEIO INFERIOR"),
+    ]
+    corners = list(base_corners)
+    if training_pattern == "extended":
+        corners.extend(extended_points)
+
+    print("\n[Treinamento] Iniciando calibração por pontos da tela...")
+    print("[Treinamento] Sequência base: superior esquerdo -> inferior esquerdo -> superior direito -> inferior direito.")
+    if training_pattern == "extended":
+        print("[Treinamento] Modo estendido habilitado com pontos extras (centro e meios).")
 
     samples: dict[str, dict[str, list[float]]] = {
         name: {"x": [], "y": []} for name, _, _, _ in corners
     }
 
-    for name, tx, ty, instruction in corners:
+    for idx, (name, tx, ty, instruction) in enumerate(corners):
         phase_start = time.perf_counter()
         while True:
             elapsed = time.perf_counter() - phase_start
@@ -435,7 +451,8 @@ def run_corner_training(
                 continue
 
             sample = backend.process(frame, cv2_module, blink_ear_threshold)
-            if sample is not None and not sample.blink:
+            collecting = elapsed >= settle_seconds
+            if collecting and sample is not None and not sample.blink:
                 samples[name]["x"].append(sample.gaze_x)
                 samples[name]["y"].append(sample.gaze_y)
 
@@ -443,6 +460,9 @@ def run_corner_training(
             cv2_module.putText(frame, "Treinamento de tela", (20, 30), cv2_module.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             cv2_module.putText(frame, instruction, (20, 60), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
             cv2_module.putText(frame, f"Tempo restante: {max(0.0, seconds_per_corner - elapsed):.1f}s", (20, 90), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 0), 2)
+            phase_text = "Coletando amostras" if collecting else "Ajuste o olhar no alvo..."
+            phase_color = (0, 255, 0) if collecting else (0, 165, 255)
+            cv2_module.putText(frame, phase_text, (20, 120), cv2_module.FONT_HERSHEY_SIMPLEX, 0.65, phase_color, 2)
             cv2_module.circle(frame, (int(tx * (w - 1)), int(ty * (h - 1))), 14, (0, 255, 0), -1)
             cv2_module.imshow("Eye Tracking UX", frame)
 
@@ -457,6 +477,24 @@ def run_corner_training(
             if key in {ord("q"), 27}:
                 print("[Treinamento] Treinamento interrompido pelo usuário.")
                 return None
+
+        if idx < len(corners) - 1 and transition_seconds > 0:
+            pause_start = time.perf_counter()
+            while True:
+                pause_elapsed = time.perf_counter() - pause_start
+                if pause_elapsed >= transition_seconds:
+                    break
+                ok, frame = cap.read()
+                if not ok:
+                    continue
+                remaining = max(0.0, transition_seconds - pause_elapsed)
+                cv2_module.putText(frame, "Prepare-se para o próximo teste", (20, 60), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                cv2_module.putText(frame, f"Próximo em: {remaining:.1f}s", (20, 90), cv2_module.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2_module.imshow("Eye Tracking UX", frame)
+                key = cv2_module.waitKey(1) & 0xFF
+                if key in {ord("q"), 27}:
+                    print("[Treinamento] Treinamento interrompido pelo usuário.")
+                    return None
 
     corner_stats: dict[str, dict[str, float]] = {}
     for name, _, _, _ in corners:
@@ -523,7 +561,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ganho vertical do ponto de olhar projetado na tela (1.0 = sem ganho).",
     )
     parser.add_argument("--skip-corner-training", action="store_true", help="Pula o treinamento de cantos da tela antes da coleta.")
-    parser.add_argument("--corner-seconds", type=float, default=2.0, help="Segundos de coleta por canto durante o treinamento.")
+    parser.add_argument("--corner-seconds", type=float, default=3.0, help="Segundos por ponto durante o treinamento (inclui estabilização/coleta).")
+    parser.add_argument("--corner-settle-seconds", type=float, default=0.8, help="Tempo de estabilização antes de começar a coletar em cada ponto.")
+    parser.add_argument("--corner-transition-seconds", type=float, default=0.8, help="Pausa entre pontos do treinamento para reposicionar o olhar.")
+    parser.add_argument("--training-pattern", choices=["corners", "extended"], default="corners", help="Padrão de treinamento: apenas 4 cantos ou cantos + pontos extras.")
     return parser
 
 
@@ -571,7 +612,10 @@ def main() -> None:
                 backend,
                 cv2,
                 blink_ear_threshold,
-                max(args.corner_seconds, 0.5),
+                max(args.corner_seconds, 1.0),
+                max(args.corner_settle_seconds, 0.0),
+                max(args.corner_transition_seconds, 0.0),
+                args.training_pattern,
             )
             if screen_calibration is None:
                 print("[Treinamento] Calibração não concluída; usando mapeamento padrão.")

@@ -49,7 +49,10 @@ Parâmetros úteis:
 - `--gaze-overlay-mode cursor|heatmap_stub` (cursor atual ou modo base para heatmap)
 - `--gaze-gain-x 1.0` e `--gaze-gain-y 1.0` (aumenta sensibilidade do ponto na tela projetada; útil quando fica preso no centro)
 - `--skip-corner-training` (pula o treinamento de cantos da tela)
-- `--corner-seconds 2.0` (tempo por canto no treinamento)
+- `--corner-seconds 3.0` (tempo por ponto no treinamento)
+- `--corner-settle-seconds 0.8` (tempo para estabilizar olhar antes de coletar em cada ponto)
+- `--corner-transition-seconds 0.8` (pausa entre um teste e outro)
+- `--training-pattern corners|extended` (somente 4 cantos ou treino estendido com pontos extras)
 
 Pressione `q` para encerrar.
 
@@ -66,7 +69,7 @@ Com isso, o sistema calcula um `blink-ear-threshold` mais adequado para sua câm
 
 ## Treinamento por cantos da tela (novo)
 
-Antes da coleta principal (se não usar `--skip-corner-training`), o app pede para olhar nesta ordem:
+Antes da coleta principal (se não usar `--skip-corner-training`), o app pede para olhar nesta ordem (modo `corners`):
 
 1. canto superior esquerdo
 2. canto inferior esquerdo
@@ -74,6 +77,8 @@ Antes da coleta principal (se não usar `--skip-corner-training`), o app pede pa
 4. canto inferior direito
 
 Com esse treinamento, o sistema aprende os limites do seu olhar para mapear melhor para a tela de projeção.
+
+No modo `extended`, ele também adiciona centro, meio esquerdo/direito e meio superior/inferior para melhorar precisão fora dos cantos.
 
 ## Precisão do ponto verde (melhoria)
 
@@ -86,7 +91,7 @@ Se ainda ficar ruim no seu ambiente, rode com `--backend mediapipe` (quando disp
 Exemplo com janela principal + tela de gaze separada:
 
 ```bash
-python eyetracking_ux.py --output-dir runs/sessao_01 --show-window --training-display-target secondary --corner-seconds 2.0 --gaze-gain-x 1.3 --gaze-gain-y 1.2
+python eyetracking_ux.py --output-dir runs/sessao_01 --show-window --training-display-target secondary --corner-seconds 3.0 --corner-settle-seconds 0.8 --corner-transition-seconds 1.0 --training-pattern extended --gaze-gain-x 1.2 --gaze-gain-y 1.2
 ```
 
 ## Saídas
