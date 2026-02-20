@@ -290,68 +290,71 @@ def main() -> None:
     frame_idx = 0
     t0 = time.perf_counter()
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-
-        h, w = frame.shape[:2]
-        timestamp_ms = (time.perf_counter() - t0) * 1000.0
-        sample = backend.process(frame, cv2, args.blink_ear_threshold)
-
-        gaze_x = float("nan")
-        gaze_y = float("nan")
-        blink = False
-        left_ear = float("nan")
-        right_ear = float("nan")
-        avg_ear = float("nan")
-        fixation_id = -1
-
-        if sample is not None:
-            gaze_x = sample.gaze_x
-            gaze_y = sample.gaze_y
-            blink = sample.blink
-            left_ear = sample.left_ear
-            right_ear = sample.right_ear
-            avg_ear = sample.avg_ear
-
-            point_px = (gaze_x * w, gaze_y * h)
-            fixation_id, finalized = update_fixation(
-                fix_state,
-                point_px,
-                timestamp_ms,
-                args.fixation_threshold_px,
-                args.fixation_min_duration_ms,
-            )
-            if finalized is not None:
-                fixation_rows.append(finalized)
-
-            if args.show_window:
-                cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
-
-        frame_rows.append(
-            {
-                "frame_idx": frame_idx,
-                "timestamp_ms": timestamp_ms,
-                "gaze_x": gaze_x,
-                "gaze_y": gaze_y,
-                "blink": blink,
-                "left_ear": left_ear,
-                "right_ear": right_ear,
-                "avg_ear": avg_ear,
-                "fixation_id": fixation_id,
-                "backend": backend_name,
-            }
-        )
-
-        if args.show_window:
-            cv2.putText(frame, f"Backend: {backend_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            cv2.putText(frame, f"Blink: {blink}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
-            cv2.imshow("Eye Tracking UX", frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
                 break
 
-        frame_idx += 1
+            h, w = frame.shape[:2]
+            timestamp_ms = (time.perf_counter() - t0) * 1000.0
+            sample = backend.process(frame, cv2, args.blink_ear_threshold)
+
+            gaze_x = float("nan")
+            gaze_y = float("nan")
+            blink = False
+            left_ear = float("nan")
+            right_ear = float("nan")
+            avg_ear = float("nan")
+            fixation_id = -1
+
+            if sample is not None:
+                gaze_x = sample.gaze_x
+                gaze_y = sample.gaze_y
+                blink = sample.blink
+                left_ear = sample.left_ear
+                right_ear = sample.right_ear
+                avg_ear = sample.avg_ear
+
+                point_px = (gaze_x * w, gaze_y * h)
+                fixation_id, finalized = update_fixation(
+                    fix_state,
+                    point_px,
+                    timestamp_ms,
+                    args.fixation_threshold_px,
+                    args.fixation_min_duration_ms,
+                )
+                if finalized is not None:
+                    fixation_rows.append(finalized)
+
+                if args.show_window:
+                    cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
+
+            frame_rows.append(
+                {
+                    "frame_idx": frame_idx,
+                    "timestamp_ms": timestamp_ms,
+                    "gaze_x": gaze_x,
+                    "gaze_y": gaze_y,
+                    "blink": blink,
+                    "left_ear": left_ear,
+                    "right_ear": right_ear,
+                    "avg_ear": avg_ear,
+                    "fixation_id": fixation_id,
+                    "backend": backend_name,
+                }
+            )
+
+            if args.show_window:
+                cv2.putText(frame, f"Backend: {backend_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(frame, f"Blink: {blink}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                cv2.imshow("Eye Tracking UX", frame)
+                if cv2.waitKey(1) & 0xFF == ord("q"):
+                    break
+
+            frame_idx += 1
+    except KeyboardInterrupt:
+        print("\nInterrompido pelo usuário (Ctrl+C). Salvando sessão...")
 
     cap.release()
     backend.close()

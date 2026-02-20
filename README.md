@@ -42,7 +42,9 @@ Parâmetros úteis:
 - `--fixation-min-duration-ms 180`
 - `--blink-ear-threshold 0.21`
 
-Pressione `q` para encerrar.
+Pressione `q` para encerrar (janela aberta).
+
+Se estiver rodando sem janela, use `Ctrl+C`: a sessão será finalizada e os CSVs serão salvos.
 
 ## Saídas
 
