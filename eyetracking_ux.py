@@ -7,10 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-import cv2
-import mediapipe as mp
 import numpy as np
-import pandas as pd
 
 
 LEFT_IRIS = [468, 469, 470, 471, 472]
@@ -39,8 +36,14 @@ class FixationState:
             self.points = []
 
 
-def to_pixel(point, width: int, height: int) -> tuple[float, float]:
-    return float(point.x * width), float(point.y * height)
+@dataclass
+class GazeSample:
+    gaze_x: float
+    gaze_y: float
+    blink: bool
+    left_ear: float
+    right_ear: float
+    avg_ear: float
 
 
 def ratio_between(v: float, a: float, b: float) -> float:
@@ -48,15 +51,6 @@ def ratio_between(v: float, a: float, b: float) -> float:
     if math.isclose(hi, lo):
         return 0.5
     return float(np.clip((v - lo) / (hi - lo), 0.0, 1.0))
-
-
-def eye_aspect_ratio(top: tuple[float, float], bottom: tuple[float, float],
-                     inner: tuple[float, float], outer: tuple[float, float]) -> float:
-    vertical = math.dist(top, bottom)
-    horizontal = math.dist(inner, outer)
-    if horizontal <= 1e-6:
-        return 0.0
-    return vertical / horizontal
 
 
 def centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
@@ -71,11 +65,6 @@ def update_fixation(
     threshold_px: float,
     min_duration_ms: float,
 ) -> tuple[int, Optional[dict]]:
-    """Atualiza estado de fixação.
-
-    Retorna:
-        fixation_id_ativo (ou -1 se não consolidado), fixation_finalizada (ou None)
-    """
     finalized = None
 
     if not state.points:
@@ -114,143 +103,257 @@ def update_fixation(
     return state.active_id, finalized
 
 
+class MediaPipeBackend:
+    def __init__(self) -> None:
+        import mediapipe as mp
+
+        self.mp = mp
+        self.face_mesh = mp.solutions.face_mesh.FaceMesh(
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+    @staticmethod
+    def to_pixel(point, width: int, height: int) -> tuple[float, float]:
+        return float(point.x * width), float(point.y * height)
+
+    @staticmethod
+    def eye_aspect_ratio(top: tuple[float, float], bottom: tuple[float, float],
+                         inner: tuple[float, float], outer: tuple[float, float]) -> float:
+        vertical = math.dist(top, bottom)
+        horizontal = math.dist(inner, outer)
+        if horizontal <= 1e-6:
+            return 0.0
+        return vertical / horizontal
+
+    def process(self, frame_bgr, cv2_module, blink_ear_threshold: float) -> Optional[GazeSample]:
+        h, w = frame_bgr.shape[:2]
+        rgb = cv2_module.cvtColor(frame_bgr, cv2_module.COLOR_BGR2RGB)
+        result = self.face_mesh.process(rgb)
+        if not result.multi_face_landmarks:
+            return None
+
+        landmarks = result.multi_face_landmarks[0].landmark
+        left_iris_pts = [self.to_pixel(landmarks[i], w, h) for i in LEFT_IRIS]
+        right_iris_pts = [self.to_pixel(landmarks[i], w, h) for i in RIGHT_IRIS]
+        left_iris_center = centroid(left_iris_pts)
+        right_iris_center = centroid(right_iris_pts)
+
+        left_inner = self.to_pixel(landmarks[LEFT_EYE_INNER], w, h)
+        left_outer = self.to_pixel(landmarks[LEFT_EYE_OUTER], w, h)
+        left_top = self.to_pixel(landmarks[LEFT_EYE_TOP], w, h)
+        left_bottom = self.to_pixel(landmarks[LEFT_EYE_BOTTOM], w, h)
+
+        right_inner = self.to_pixel(landmarks[RIGHT_EYE_INNER], w, h)
+        right_outer = self.to_pixel(landmarks[RIGHT_EYE_OUTER], w, h)
+        right_top = self.to_pixel(landmarks[RIGHT_EYE_TOP], w, h)
+        right_bottom = self.to_pixel(landmarks[RIGHT_EYE_BOTTOM], w, h)
+
+        left_ratio_x = ratio_between(left_iris_center[0], left_outer[0], left_inner[0])
+        right_ratio_x = ratio_between(right_iris_center[0], right_outer[0], right_inner[0])
+        left_ratio_y = ratio_between(left_iris_center[1], left_top[1], left_bottom[1])
+        right_ratio_y = ratio_between(right_iris_center[1], right_top[1], right_bottom[1])
+
+        gaze_x = float(np.clip((left_ratio_x + right_ratio_x) / 2.0, 0.0, 1.0))
+        gaze_y = float(np.clip((left_ratio_y + right_ratio_y) / 2.0, 0.0, 1.0))
+
+        left_ear = self.eye_aspect_ratio(left_top, left_bottom, left_inner, left_outer)
+        right_ear = self.eye_aspect_ratio(right_top, right_bottom, right_inner, right_outer)
+        avg_ear = (left_ear + right_ear) / 2.0
+
+        return GazeSample(gaze_x, gaze_y, avg_ear < blink_ear_threshold, left_ear, right_ear, avg_ear)
+
+    def close(self) -> None:
+        self.face_mesh.close()
+
+
+class OpenCVBackend:
+    def __init__(self, cv2_module) -> None:
+        self.cv2 = cv2_module
+        self.face = cv2_module.CascadeClassifier(
+            cv2_module.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+        self.eyes = cv2_module.CascadeClassifier(
+            cv2_module.data.haarcascades + "haarcascade_eye_tree_eyeglasses.xml"
+        )
+
+    def _pupil_ratio(self, gray_eye) -> tuple[float, float]:
+        blur = self.cv2.GaussianBlur(gray_eye, (7, 7), 0)
+        _, thresh = self.cv2.threshold(blur, 0, 255, self.cv2.THRESH_BINARY_INV + self.cv2.THRESH_OTSU)
+        m = self.cv2.moments(thresh)
+        h, w = gray_eye.shape[:2]
+        if m["m00"] < 1:
+            return 0.5, 0.5
+        cx = m["m10"] / m["m00"]
+        cy = m["m01"] / m["m00"]
+        return float(np.clip(cx / max(w, 1), 0.0, 1.0)), float(np.clip(cy / max(h, 1), 0.0, 1.0))
+
+    def process(self, frame_bgr, cv2_module, blink_ear_threshold: float) -> Optional[GazeSample]:
+        gray = cv2_module.cvtColor(frame_bgr, cv2_module.COLOR_BGR2GRAY)
+        faces = self.face.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=5, minSize=(80, 80))
+        if len(faces) == 0:
+            return None
+
+        x, y, w, h = max(faces, key=lambda r: r[2] * r[3])
+        roi = gray[y:y + int(h * 0.6), x:x + w]
+        eyes = self.eyes.detectMultiScale(roi, scaleFactor=1.1, minNeighbors=6, minSize=(20, 20))
+        if len(eyes) < 1:
+            return None
+
+        selected = sorted(eyes, key=lambda r: r[2] * r[3], reverse=True)[:2]
+        x_ratios, y_ratios, ears = [], [], []
+
+        for ex, ey, ew, eh in selected:
+            eye_roi = roi[ey:ey + eh, ex:ex + ew]
+            if eye_roi.size == 0:
+                continue
+            rx, ry = self._pupil_ratio(eye_roi)
+            x_ratios.append(rx)
+            y_ratios.append(ry)
+            ears.append(eh / max(ew, 1))
+
+        if not x_ratios:
+            return None
+
+        gaze_x = float(np.clip(np.mean(x_ratios), 0.0, 1.0))
+        gaze_y = float(np.clip(np.mean(y_ratios), 0.0, 1.0))
+        avg_ear = float(np.mean(ears)) if ears else np.nan
+        left_ear = float(ears[0]) if len(ears) > 0 else np.nan
+        right_ear = float(ears[1]) if len(ears) > 1 else np.nan
+        blink = bool(avg_ear < blink_ear_threshold)
+        return GazeSample(gaze_x, gaze_y, blink, left_ear, right_ear, avg_ear)
+
+    def close(self) -> None:
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Eye tracking por webcam para UX")
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/default_session"))
     parser.add_argument("--show-window", action="store_true")
+    parser.add_argument("--backend", choices=["auto", "mediapipe", "opencv"], default="auto")
     parser.add_argument("--fixation-threshold-px", type=float, default=60.0)
     parser.add_argument("--fixation-min-duration-ms", type=float, default=180.0)
     parser.add_argument("--blink-ear-threshold", type=float, default=0.21)
     return parser
 
 
+def choose_backend(name: str, cv2_module):
+    if name in {"auto", "mediapipe"}:
+        try:
+            return MediaPipeBackend(), "mediapipe"
+        except Exception:
+            if name == "mediapipe":
+                raise
+    return OpenCVBackend(cv2_module), "opencv"
+
+
 def main() -> None:
     args = build_parser().parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
 
+    import cv2
+
+    args.output_dir.mkdir(parents=True, exist_ok=True)
     cap = cv2.VideoCapture(args.camera_index)
     if not cap.isOpened():
         raise RuntimeError("Não foi possível abrir a webcam.")
 
-    mp_face_mesh = mp.solutions.face_mesh
+    backend, backend_name = choose_backend(args.backend, cv2)
+    print(f"Backend selecionado: {backend_name}")
+
     frame_rows: list[dict] = []
     fixation_rows: list[dict] = []
     fix_state = FixationState()
 
-    with mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    ) as face_mesh:
-        frame_idx = 0
-        t0 = time.perf_counter()
+    frame_idx = 0
+    t0 = time.perf_counter()
 
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
 
-            h, w = frame.shape[:2]
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = face_mesh.process(rgb)
-            timestamp_ms = (time.perf_counter() - t0) * 1000.0
+        h, w = frame.shape[:2]
+        timestamp_ms = (time.perf_counter() - t0) * 1000.0
+        sample = backend.process(frame, cv2, args.blink_ear_threshold)
 
-            gaze_x = np.nan
-            gaze_y = np.nan
-            blink = False
-            left_ear = np.nan
-            right_ear = np.nan
-            avg_ear = np.nan
-            fixation_id = -1
+        gaze_x = np.nan
+        gaze_y = np.nan
+        blink = False
+        left_ear = np.nan
+        right_ear = np.nan
+        avg_ear = np.nan
+        fixation_id = -1
 
-            if result.multi_face_landmarks:
-                landmarks = result.multi_face_landmarks[0].landmark
+        if sample is not None:
+            gaze_x = sample.gaze_x
+            gaze_y = sample.gaze_y
+            blink = sample.blink
+            left_ear = sample.left_ear
+            right_ear = sample.right_ear
+            avg_ear = sample.avg_ear
 
-                left_iris_pts = [to_pixel(landmarks[i], w, h) for i in LEFT_IRIS]
-                right_iris_pts = [to_pixel(landmarks[i], w, h) for i in RIGHT_IRIS]
-                left_iris_center = centroid(left_iris_pts)
-                right_iris_center = centroid(right_iris_pts)
-
-                left_inner = to_pixel(landmarks[LEFT_EYE_INNER], w, h)
-                left_outer = to_pixel(landmarks[LEFT_EYE_OUTER], w, h)
-                left_top = to_pixel(landmarks[LEFT_EYE_TOP], w, h)
-                left_bottom = to_pixel(landmarks[LEFT_EYE_BOTTOM], w, h)
-
-                right_inner = to_pixel(landmarks[RIGHT_EYE_INNER], w, h)
-                right_outer = to_pixel(landmarks[RIGHT_EYE_OUTER], w, h)
-                right_top = to_pixel(landmarks[RIGHT_EYE_TOP], w, h)
-                right_bottom = to_pixel(landmarks[RIGHT_EYE_BOTTOM], w, h)
-
-                left_ratio_x = ratio_between(left_iris_center[0], left_outer[0], left_inner[0])
-                right_ratio_x = ratio_between(right_iris_center[0], right_outer[0], right_inner[0])
-                left_ratio_y = ratio_between(left_iris_center[1], left_top[1], left_bottom[1])
-                right_ratio_y = ratio_between(right_iris_center[1], right_top[1], right_bottom[1])
-
-                gaze_x = float(np.clip((left_ratio_x + right_ratio_x) / 2.0, 0.0, 1.0))
-                gaze_y = float(np.clip((left_ratio_y + right_ratio_y) / 2.0, 0.0, 1.0))
-
-                left_ear = eye_aspect_ratio(left_top, left_bottom, left_inner, left_outer)
-                right_ear = eye_aspect_ratio(right_top, right_bottom, right_inner, right_outer)
-                avg_ear = (left_ear + right_ear) / 2.0
-                blink = avg_ear < args.blink_ear_threshold
-
-                point_px = (gaze_x * w, gaze_y * h)
-                fixation_id, finalized = update_fixation(
-                    fix_state,
-                    point_px,
-                    timestamp_ms,
-                    args.fixation_threshold_px,
-                    args.fixation_min_duration_ms,
-                )
-                if finalized is not None:
-                    fixation_rows.append(finalized)
-
-                if args.show_window:
-                    cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
-
-            frame_rows.append(
-                {
-                    "frame_idx": frame_idx,
-                    "timestamp_ms": timestamp_ms,
-                    "gaze_x": gaze_x,
-                    "gaze_y": gaze_y,
-                    "blink": blink,
-                    "left_ear": left_ear,
-                    "right_ear": right_ear,
-                    "avg_ear": avg_ear,
-                    "fixation_id": fixation_id,
-                }
+            point_px = (gaze_x * w, gaze_y * h)
+            fixation_id, finalized = update_fixation(
+                fix_state,
+                point_px,
+                timestamp_ms,
+                args.fixation_threshold_px,
+                args.fixation_min_duration_ms,
             )
+            if finalized is not None:
+                fixation_rows.append(finalized)
 
             if args.show_window:
-                cv2.putText(
-                    frame,
-                    f"Blink: {blink}  EAR: {avg_ear:.3f}" if not np.isnan(avg_ear) else "Blink: N/A",
-                    (20, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (0, 255, 255),
-                    2,
-                )
-                cv2.putText(
-                    frame,
-                    f"Fixation ID: {fixation_id}",
-                    (20, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255, 255, 0),
-                    2,
-                )
-                cv2.imshow("Eye Tracking UX", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
+                cv2.circle(frame, (int(point_px[0]), int(point_px[1])), 8, (0, 255, 0), -1)
 
-            frame_idx += 1
+        frame_rows.append(
+            {
+                "frame_idx": frame_idx,
+                "timestamp_ms": timestamp_ms,
+                "gaze_x": gaze_x,
+                "gaze_y": gaze_y,
+                "blink": blink,
+                "left_ear": left_ear,
+                "right_ear": right_ear,
+                "avg_ear": avg_ear,
+                "fixation_id": fixation_id,
+                "backend": backend_name,
+            }
+        )
+
+        if args.show_window:
+            cv2.putText(
+                frame,
+                f"Backend: {backend_name}",
+                (20, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+            )
+            cv2.putText(
+                frame,
+                f"Blink: {blink}",
+                (20, 60),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 0),
+                2,
+            )
+            cv2.imshow("Eye Tracking UX", frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
+
+        frame_idx += 1
 
     cap.release()
-    cv2.destroyAllWindows()
+    backend.close()
+    if args.show_window:
+        cv2.destroyAllWindows()
 
     if fix_state.points and fix_state.start_ms is not None and frame_rows:
         end_ms = frame_rows[-1]["timestamp_ms"]
@@ -271,6 +374,8 @@ def main() -> None:
 
     frames_path = args.output_dir / "frames.csv"
     fixations_path = args.output_dir / "fixations.csv"
+    import pandas as pd
+
     pd.DataFrame(frame_rows).to_csv(frames_path, index=False)
     pd.DataFrame(fixation_rows).to_csv(fixations_path, index=False)
 
