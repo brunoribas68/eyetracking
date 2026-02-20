@@ -68,10 +68,10 @@ Com isso, o sistema calcula um `blink-ear-threshold` mais adequado para sua câm
 
 Antes da coleta principal (se não usar `--skip-corner-training`), o app pede para olhar nesta ordem:
 
-1. canto superior direito
-2. canto inferior direito
-3. canto superior esquerdo
-4. canto inferior esquerdo
+1. canto superior esquerdo
+2. canto inferior esquerdo
+3. canto superior direito
+4. canto inferior direito
 
 Com esse treinamento, o sistema aprende os limites do seu olhar para mapear melhor para a tela de projeção.
 

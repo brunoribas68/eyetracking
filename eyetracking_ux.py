@@ -411,13 +411,13 @@ def run_corner_training(
     seconds_per_corner: float,
 ) -> Optional[ScreenCalibration]:
     corners = [
-        ("top_right", 0.90, 0.10, "Olhe para o canto SUPERIOR DIREITO"),
-        ("bottom_right", 0.90, 0.90, "Olhe para o canto INFERIOR DIREITO"),
-        ("top_left", 0.10, 0.10, "Olhe para o canto SUPERIOR ESQUERDO"),
-        ("bottom_left", 0.10, 0.90, "Olhe para o canto INFERIOR ESQUERDO"),
+        ("top_left", 0.10, 0.10, "Teste 1: Olhe para o canto SUPERIOR ESQUERDO"),
+        ("bottom_left", 0.10, 0.90, "Teste 2: Olhe para o canto INFERIOR ESQUERDO"),
+        ("top_right", 0.90, 0.10, "Teste 3: Olhe para o canto SUPERIOR DIREITO"),
+        ("bottom_right", 0.90, 0.90, "Teste 4: Olhe para o canto INFERIOR DIREITO"),
     ]
     print("\n[Treinamento] Iniciando calibração por cantos da tela...")
-    print("[Treinamento] Sequência: superior direito -> inferior direito -> superior esquerdo -> inferior esquerdo.")
+    print("[Treinamento] Sequência: superior esquerdo -> inferior esquerdo -> superior direito -> inferior direito.")
 
     samples: dict[str, dict[str, list[float]]] = {
         name: {"x": [], "y": []} for name, _, _, _ in corners
