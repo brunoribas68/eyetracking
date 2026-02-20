@@ -2,35 +2,31 @@
 
 Pipeline para coletar dados oculares em tempo real via webcam com exportação em CSV para análises de UX.
 
-## Novidade importante (compatibilidade)
+## Compatibilidade (corrigido para seu caso)
 
-O projeto agora suporta **2 backends**:
+Para evitar erros de instalação no Windows (especialmente Python 32-bit/x86), o projeto agora depende **somente de OpenCV** no `requirements.txt`.
 
-- `mediapipe` (mais preciso quando disponível)
-- `opencv` (fallback sem MediaPipe, mais compatível)
-
-No modo padrão (`--backend auto`), o script tenta MediaPipe e, se não estiver instalado/disponível no Python da máquina, cai automaticamente para OpenCV.
+- Backend padrão: `opencv` (compatível)
+- Backend opcional: `mediapipe` (instalação manual, se disponível)
 
 ## Requisitos
 
 - Python 3.10+
 - Webcam
 
-Instalação base (sempre funciona para backend OpenCV):
+## Instalação
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### MediaPipe (opcional)
+### MediaPipe opcional
 
-Se quiser usar backend `mediapipe`, instale manualmente quando houver wheel para sua versão de Python/SO:
+Se quiser tentar maior precisão e seu ambiente suportar:
 
 ```bash
 pip install mediapipe
 ```
-
-> Em algumas combinações (ex.: Python muito novo), pode não haver pacote disponível.
 
 ## Como rodar
 
@@ -40,7 +36,7 @@ python eyetracking_ux.py --output-dir runs/sessao_01 --show-window
 
 Parâmetros úteis:
 
-- `--backend auto|mediapipe|opencv`
+- `--backend auto|mediapipe|opencv` (padrão: `auto`)
 - `--camera-index 0`
 - `--fixation-threshold-px 60`
 - `--fixation-min-duration-ms 180`
@@ -67,6 +63,16 @@ Pressione `q` para encerrar.
 - `centroid_x`, `centroid_y`
 - `samples`
 
-## Observação científica
+## Dica para seu erro atual
 
-Eye tracking por webcam é aproximação. Para TCC/publicação, inclua calibração, protocolo experimental e validação de erro.
+Se aparecer erro de `numpy`/`pandas`, apague a `.venv` e recrie:
+
+```bash
+# PowerShell
+Deactivate
+Remove-Item -Recurse -Force .venv
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python .\eyetracking_ux.py --backend opencv --show-window
+```

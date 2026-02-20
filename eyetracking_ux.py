@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-
-import numpy as np
 
 
 LEFT_IRIS = [468, 469, 470, 471, 472]
@@ -22,6 +21,16 @@ RIGHT_EYE_INNER = 362
 RIGHT_EYE_OUTER = 263
 RIGHT_EYE_TOP = 386
 RIGHT_EYE_BOTTOM = 374
+
+
+def clip(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, v))
+
+
+def safe_mean(values: list[float]) -> float:
+    if not values:
+        return float("nan")
+    return sum(values) / len(values)
 
 
 @dataclass
@@ -50,12 +59,14 @@ def ratio_between(v: float, a: float, b: float) -> float:
     lo, hi = min(a, b), max(a, b)
     if math.isclose(hi, lo):
         return 0.5
-    return float(np.clip((v - lo) / (hi - lo), 0.0, 1.0))
+    return clip((v - lo) / (hi - lo), 0.0, 1.0)
 
 
 def centroid(points: list[tuple[float, float]]) -> tuple[float, float]:
-    arr = np.array(points, dtype=np.float32)
-    return float(arr[:, 0].mean()), float(arr[:, 1].mean())
+    x_sum = sum(p[0] for p in points)
+    y_sum = sum(p[1] for p in points)
+    n = max(len(points), 1)
+    return x_sum / n, y_sum / n
 
 
 def update_fixation(
@@ -107,7 +118,6 @@ class MediaPipeBackend:
     def __init__(self) -> None:
         import mediapipe as mp
 
-        self.mp = mp
         self.face_mesh = mp.solutions.face_mesh.FaceMesh(
             max_num_faces=1,
             refine_landmarks=True,
@@ -156,8 +166,8 @@ class MediaPipeBackend:
         left_ratio_y = ratio_between(left_iris_center[1], left_top[1], left_bottom[1])
         right_ratio_y = ratio_between(right_iris_center[1], right_top[1], right_bottom[1])
 
-        gaze_x = float(np.clip((left_ratio_x + right_ratio_x) / 2.0, 0.0, 1.0))
-        gaze_y = float(np.clip((left_ratio_y + right_ratio_y) / 2.0, 0.0, 1.0))
+        gaze_x = clip((left_ratio_x + right_ratio_x) / 2.0)
+        gaze_y = clip((left_ratio_y + right_ratio_y) / 2.0)
 
         left_ear = self.eye_aspect_ratio(left_top, left_bottom, left_inner, left_outer)
         right_ear = self.eye_aspect_ratio(right_top, right_bottom, right_inner, right_outer)
@@ -188,7 +198,7 @@ class OpenCVBackend:
             return 0.5, 0.5
         cx = m["m10"] / m["m00"]
         cy = m["m01"] / m["m00"]
-        return float(np.clip(cx / max(w, 1), 0.0, 1.0)), float(np.clip(cy / max(h, 1), 0.0, 1.0))
+        return clip(cx / max(w, 1)), clip(cy / max(h, 1))
 
     def process(self, frame_bgr, cv2_module, blink_ear_threshold: float) -> Optional[GazeSample]:
         gray = cv2_module.cvtColor(frame_bgr, cv2_module.COLOR_BGR2GRAY)
@@ -203,7 +213,9 @@ class OpenCVBackend:
             return None
 
         selected = sorted(eyes, key=lambda r: r[2] * r[3], reverse=True)[:2]
-        x_ratios, y_ratios, ears = [], [], []
+        x_ratios: list[float] = []
+        y_ratios: list[float] = []
+        ears: list[float] = []
 
         for ex, ey, ew, eh in selected:
             eye_roi = roi[ey:ey + eh, ex:ex + ew]
@@ -217,16 +229,24 @@ class OpenCVBackend:
         if not x_ratios:
             return None
 
-        gaze_x = float(np.clip(np.mean(x_ratios), 0.0, 1.0))
-        gaze_y = float(np.clip(np.mean(y_ratios), 0.0, 1.0))
-        avg_ear = float(np.mean(ears)) if ears else np.nan
-        left_ear = float(ears[0]) if len(ears) > 0 else np.nan
-        right_ear = float(ears[1]) if len(ears) > 1 else np.nan
-        blink = bool(avg_ear < blink_ear_threshold)
+        gaze_x = clip(safe_mean(x_ratios))
+        gaze_y = clip(safe_mean(y_ratios))
+        avg_ear = safe_mean(ears)
+        left_ear = ears[0] if len(ears) > 0 else float("nan")
+        right_ear = ears[1] if len(ears) > 1 else float("nan")
+        blink = (not math.isnan(avg_ear)) and (avg_ear < blink_ear_threshold)
         return GazeSample(gaze_x, gaze_y, blink, left_ear, right_ear, avg_ear)
 
     def close(self) -> None:
         return None
+
+
+def write_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -253,7 +273,6 @@ def choose_backend(name: str, cv2_module):
 
 def main() -> None:
     args = build_parser().parse_args()
-
     import cv2
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -280,12 +299,12 @@ def main() -> None:
         timestamp_ms = (time.perf_counter() - t0) * 1000.0
         sample = backend.process(frame, cv2, args.blink_ear_threshold)
 
-        gaze_x = np.nan
-        gaze_y = np.nan
+        gaze_x = float("nan")
+        gaze_y = float("nan")
         blink = False
-        left_ear = np.nan
-        right_ear = np.nan
-        avg_ear = np.nan
+        left_ear = float("nan")
+        right_ear = float("nan")
+        avg_ear = float("nan")
         fixation_id = -1
 
         if sample is not None:
@@ -326,24 +345,8 @@ def main() -> None:
         )
 
         if args.show_window:
-            cv2.putText(
-                frame,
-                f"Backend: {backend_name}",
-                (20, 30),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-            )
-            cv2.putText(
-                frame,
-                f"Blink: {blink}",
-                (20, 60),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (255, 255, 0),
-                2,
-            )
+            cv2.putText(frame, f"Backend: {backend_name}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.putText(frame, f"Blink: {blink}", (20, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
             cv2.imshow("Eye Tracking UX", frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
@@ -374,10 +377,28 @@ def main() -> None:
 
     frames_path = args.output_dir / "frames.csv"
     fixations_path = args.output_dir / "fixations.csv"
-    import pandas as pd
 
-    pd.DataFrame(frame_rows).to_csv(frames_path, index=False)
-    pd.DataFrame(fixation_rows).to_csv(fixations_path, index=False)
+    write_csv(
+        frames_path,
+        frame_rows,
+        [
+            "frame_idx",
+            "timestamp_ms",
+            "gaze_x",
+            "gaze_y",
+            "blink",
+            "left_ear",
+            "right_ear",
+            "avg_ear",
+            "fixation_id",
+            "backend",
+        ],
+    )
+    write_csv(
+        fixations_path,
+        fixation_rows,
+        ["fixation_id", "start_ms", "end_ms", "duration_ms", "centroid_x", "centroid_y", "samples"],
+    )
 
     print(f"Frames salvos em: {frames_path}")
     print(f"Fixações salvas em: {fixations_path}")
