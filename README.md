@@ -1,137 +1,82 @@
-# Eye Tracking para UX (Webcam)
+# Eye Tracking para UX com webcam
 
-Pipeline para coletar dados oculares em tempo real via webcam com exportação em CSV para análises de UX.
+Protótipo (MVP) para coletar dados de rastreamento ocular com uma webcam comum
+e transformá-los em métricas de UX (mapa de calor, scanpath, métricas por AOI).
+Base do artigo *"Obtenção de dados de rastreamento ocular utilizando Inteligência
+Artificial"* (Especialização em IA Aplicada — UFPR/SEPT).
 
-## Compatibilidade (corrigido para seu caso)
+## Como funciona
 
-Para evitar erros de instalação no Windows (especialmente Python 32-bit/x86), o projeto agora depende **somente de OpenCV** no `requirements.txt`.
-
-- Backend padrão: `opencv` (compatível)
-- Backend opcional: `mediapipe` (instalação manual, se disponível)
-
-## Requisitos
-
-- Python 3.10+
-- Webcam
+| Fase | O que acontece | Técnica |
+|---|---|---|
+| Detecção | rosto + 478 pontos faciais, incluindo íris | MediaPipe Face Mesh (CNN) · fallback Haar/Viola-Jones |
+| Características | posição da íris no olho (x, y) + pose aproximada da cabeça | geometria dos landmarks |
+| Piscada | Eye Aspect Ratio (EAR) com limiar calibrado por pessoa | Soukupová & Čech (2016) |
+| Calibração | 9 alvos em tela cheia → regressão (linear ou polinomial 2º grau, ridge) | aprendizado supervisionado |
+| Validação | 5 alvos **novos** → acurácia e precisão em px e graus | Holmqvist et al. (2012) |
+| Suavização | filtro One Euro | Casiez et al. (2012) |
+| Fixações | I-DT (dispersão) online | Salvucci & Goldberg (2000) |
+| Análise | heatmap, scanpath, TTFF, dwell time, contagem por AOI | `analyze_session.py` |
 
 ## Instalação
 
 ```bash
-pip install -r requirements.txt
-```
-
-### MediaPipe opcional
-
-Se quiser tentar maior precisão e seu ambiente suportar:
-
-```bash
-pip install mediapipe
-```
-
-## Como rodar
-
-```bash
-python eyetracking_ux.py --output-dir runs/sessao_01 --show-window
-```
-
-Parâmetros úteis:
-
-- `--backend auto|mediapipe|opencv` (padrão: `auto`)
-- `--camera-index 0`
-- `--fixation-threshold-px 60`
-- `--fixation-min-duration-ms 180`
-- `--blink-ear-threshold 0.21`
-- `--precheck-seconds 8` (etapa antes da calibragem para validar detecção e ajustar EAR)
-- `--skip-precheck` (pula essa etapa)
-- `--max-session-seconds 120` (para automaticamente após N segundos e salva tudo)
-- `--training-display-target main|secondary|remote` (prepara estratégia de exibição para treino/UX)
-  - em `secondary|remote`, abre a janela extra `Eye Tracking UX - Gaze Screen` com o ponto de olhar projetado
-- `--gaze-overlay-mode cursor|heatmap_stub` (cursor atual ou modo base para heatmap)
-- `--gaze-gain-x 1.0` e `--gaze-gain-y 1.0` (aumenta sensibilidade do ponto na tela projetada; útil quando fica preso no centro)
-- `--skip-corner-training` (pula o treinamento de cantos da tela)
-- `--corner-seconds 3.0` (tempo por ponto no treinamento)
-- `--corner-settle-seconds 0.8` (tempo para estabilizar olhar antes de coletar em cada ponto)
-- `--corner-transition-seconds 0.8` (pausa entre um teste e outro)
-- `--training-pattern corners|extended` (somente 4 cantos ou treino estendido com pontos extras)
-
-Pressione `q` para encerrar.
-
-Também é possível interromper com `Ctrl+C` que a sessão parcial será salva.
-
-## Pré-calibragem (novo)
-
-Antes da coleta principal, o app roda uma etapa curta para melhorar a detecção de piscada:
-
-1. Metade do tempo: mantenha os olhos abertos.
-2. Metade do tempo: pisque naturalmente.
-
-Com isso, o sistema calcula um `blink-ear-threshold` mais adequado para sua câmera/iluminação e também informa a cobertura de detecção de rosto/olhos.
-
-## Treinamento por cantos da tela (novo)
-
-Antes da coleta principal (se não usar `--skip-corner-training`), o app pede para olhar nesta ordem (modo `corners`):
-
-1. canto superior esquerdo
-2. canto inferior esquerdo
-3. canto superior direito
-4. canto inferior direito
-
-Com esse treinamento, o sistema aprende os limites do seu olhar para mapear melhor para a tela de projeção.
-
-No modo `extended`, ele também adiciona centro, meio esquerdo/direito e meio superior/inferior para melhorar precisão fora dos cantos.
-
-## Precisão do ponto verde (melhoria)
-
-O cursor verde agora usa a posição estimada da pupila/íris detectada no frame (não apenas o `gaze_x/gaze_y` normalizado), o que reduz casos em que o ponto “escapa” para bochecha/rosto.
-
-No backend `opencv`, foi adicionado um filtro de qualidade para descartar caixas de olho improváveis (posição e proporção), reduzindo falsos positivos.
-
-Se ainda ficar ruim no seu ambiente, rode com `--backend mediapipe` (quando disponível), que tende a ser mais robusto.
-
-Exemplo com janela principal + tela de gaze separada:
-
-```bash
-python eyetracking_ux.py --output-dir runs/sessao_01 --show-window --training-display-target secondary --corner-seconds 3.0 --corner-settle-seconds 0.8 --corner-transition-seconds 1.0 --training-pattern extended --gaze-gain-x 1.2 --gaze-gain-y 1.2
-```
-
-## Saídas
-
-### `session.json`
-
-Resumo da sessão com:
-
-- motivo de parada (`stop_reason`)
-- backend utilizado
-- quantidade de frames/fixações
-- configuração de treino para próximos passos de UX (tela principal/secundária/remoto)
-
-### `frames.csv`
-
-- `frame_idx`
-- `timestamp_ms`
-- `gaze_x`, `gaze_y` (0..1)
-- `blink`
-- `left_ear`, `right_ear`, `avg_ear`
-- `fixation_id`
-- `backend`
-
-### `fixations.csv`
-
-- `fixation_id`
-- `start_ms`, `end_ms`, `duration_ms`
-- `centroid_x`, `centroid_y`
-- `samples`
-
-## Dica para seu erro atual
-
-Se aparecer erro de `numpy`/`pandas`, apague a `.venv` e recrie:
-
-```bash
-# PowerShell
-Deactivate
-Remove-Item -Recurse -Force .venv
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
+# Windows: .\.venv\Scripts\Activate.ps1   |   Linux/Mac: source .venv/bin/activate
 pip install -r requirements.txt
-python .\eyetracking_ux.py --backend opencv --show-window
+pip install "mediapipe==0.10.14"   # opcional, mas recomendado
 ```
+
+> Use Python **64 bits** (3.9–3.12). O erro antigo de numpy/pandas no Windows vinha
+> de Python 32 bits; o OpenCV já depende do numpy, então ele não tem como sair.
+
+## Rodando uma sessão
+
+```bash
+python eyetracking_ux.py --participant P01 --output-dir runs/P01 \
+    --stimulus estimulos/home.png --task-text "Encontre onde localizar uma loja" \
+    --max-session-seconds 30 --screen-width-cm 53 --distance-cm 60 --show-camera
+```
+
+A janela abre em tela cheia. O participante aperta **ESPAÇO** em cada tela de
+instrução; **Q/ESC** interrompe (o que já foi coletado é salvo).
+
+- `--screen-width-cm` e `--distance-cm` permitem reportar erro em **graus visuais**
+  (padrão da literatura). Meça a largura da área visível da tela e a distância olho–tela.
+- `--calibration-model linear|poly2`, `--calibration-points 5|9|13`
+- `--show-gaze` mostra o cursor do olhar sobre o estímulo (só demonstração: num teste
+  real ele atrai o olhar e enviesa os dados).
+- `python eyetracking_ux.py -h` lista todos os parâmetros.
+
+Saídas em `runs/P01/`: `session.json` (configuração, calibração, métricas de
+validação e de gravação), `frames.csv`, `fixations.csv`, `calibration_samples.csv`.
+
+## Analisando
+
+```bash
+python analyze_session.py runs/P01 runs/P02 runs/P03 \
+    --stimulus estimulos/home.png --aois aois_exemplo.json --out resultados --compare-models
+```
+
+Gera `group_heatmap.png`, `heatmap_<P>.png`, `scanpath_<P>.png`, `summary.csv`
+(qualidade dos dados por participante), `aoi_metrics.csv` e `model_comparison.csv`
+(linear × polinomial, com e sem pose da cabeça, treinado na calibração e avaliado
+na validação).
+
+## Testes
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest -q
+```
+
+Inclui um teste ponta a ponta com câmera, rosto e tela simulados.
+
+## Limitações conhecidas
+
+- Webcam comum fica tipicamente na casa de alguns graus de erro — bom para regiões
+  da página (AOIs grandes), não para palavras ou ícones pequenos.
+- A pose da cabeça é aproximada; movimentos grandes após a calibração degradam o
+  mapeamento (recalibre ou use apoio de queixo).
+- Óculos com reflexo, pouca luz e contraluz aumentam a perda de dados.
+- O backend OpenCV não detecta piscadas (olho fechado vira "sem detecção").
