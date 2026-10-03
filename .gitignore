@@ -5,3 +5,14 @@ __pycache__/
 runs/
 resultados/
 estudos/*/sessoes/
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.run.xml
+*.synctex.gz
+artigo/Latex/*.pdf
