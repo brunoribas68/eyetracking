@@ -58,10 +58,17 @@ python analyze_session.py runs/P01 runs/P02 runs/P03 \
     --stimulus estimulos/home.png --aois aois_exemplo.json --out resultados --compare-models
 ```
 
-Gera `group_heatmap.png`, `heatmap_<P>.png`, `scanpath_<P>.png`, `summary.csv`
-(qualidade dos dados por participante), `aoi_metrics.csv` e `model_comparison.csv`
+Gera `heatmap/` (`group_heatmap.png`, `heatmap_<P>.png`), `scanpath/`
+(`scanpath_<P>.png`), `aois/` (`aois.png` e `aoi_metrics.csv`), `summary.csv`
+(qualidade dos dados por participante) e `model_comparison.csv`
 (linear × polinomial, com e sem pose da cabeça, treinado na calibração e avaliado
 na validação).
+
+### Pastas de estudo
+
+Para manter estímulo, AOIs, sessões e resultados juntos, use `estudos/<nome>/`
+(ex.: `estudos/f1tv/`) e rode `python analyze_session.py --study estudos/f1tv`.
+Detalhes em [estudos/README.md](estudos/README.md).
 
 ### Reprocessar sessões já gravadas
 

@@ -2,6 +2,7 @@
 import json
 import math
 import random
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -207,11 +208,21 @@ def test_full_session_and_analysis(tmp_path):
     res = tmp_path / "res"
     analyze_session.main([str(out), "--stimulus", str(stim_path), "--aois", str(aois),
                           "--out", str(res), "--compare-models"])
-    for name in ("group_heatmap.png", "heatmap_P01.png", "scanpath_P01.png", "summary.csv",
-                 "aoi_metrics.csv", "model_comparison.csv"):
+    for name in ("heatmap/group_heatmap.png", "heatmap/heatmap_P01.png", "scanpath/scanpath_P01.png",
+                 "aois/aois.png", "aois/aoi_metrics.csv", "summary.csv", "model_comparison.csv"):
         assert (res / name).exists(), name
-    aoi = analyze_session.read_csv(res / "aoi_metrics.csv")
+    aoi = analyze_session.read_csv(res / "aois" / "aoi_metrics.csv")
     assert all(r["hit"] for r in aoi)
+
+    # mesma análise a partir de uma pasta de estudo
+    study = tmp_path / "estudo"
+    (study / "sessoes").mkdir(parents=True)
+    shutil.copytree(out, study / "sessoes" / "P01")
+    shutil.copy(aois, study / "aois.json")
+    shutil.copy(stim_path, study / "estimulo.png")
+    analyze_session.main(["--study", str(study)])
+    for name in ("heatmap/heatmap_P01.png", "scanpath/scanpath_P01.png", "aois/aoi_metrics.csv"):
+        assert (study / "resultados" / name).exists(), name
 
     res2 = tmp_path / "res2"
     analyze_session.main([str(out), "--stimulus", str(stim_path), "--out", str(res2), "--reprocess"])
