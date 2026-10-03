@@ -31,12 +31,14 @@ import numpy as np
 
 from gaze_core import (
     FEATURE_NAMES,
+    EarModel,
     GazeCalibrator,
-    IDTFixationDetector,
     Letterbox,
-    PointFilter,
+    ProcessingParams,
     clean_calibration_samples,
     grid_points,
+    label_target_blinks,
+    process_recording,
     px_per_degree,
     validation_metrics,
 )
@@ -381,7 +383,8 @@ def run_precheck(ctx: Ctx, seconds: float) -> dict:
             print("[pré-checagem] nenhuma piscada clara detectada; usando 70% do EAR aberto.")
         ctx.backend.blink_threshold = threshold
         result.update(open_ear_median=open_med, blink_ear_p5=blink_low,
-                      blink_threshold=threshold, blink_threshold_method=method)
+                      blink_threshold=threshold, blink_threshold_method=method,
+                      blink_ratio=threshold / open_med)
     print(f"[pré-checagem] cobertura {result['coverage'] * 100:.1f}% | limiar de piscada {result['blink_threshold']}")
     if result["coverage"] < 0.8:
         print("[pré-checagem] atenção: detecção abaixo de 80%. Melhore iluminação/enquadramento.")
@@ -403,7 +406,8 @@ def collect_targets(ctx: Ctx, phase: str, targets: list[tuple[float, float]], se
                 continue
             rec = {"phase": phase, "target_idx": idx, "target_x": tx, "target_y": ty,
                    "timestamp_ms": ctx.now_ms(), "valid": sample is not None and not sample.blink,
-                   "blink": bool(sample.blink) if sample else False}
+                   "blink": bool(sample.blink) if sample else False,
+                   "avg_ear": sample.avg_ear if sample else float("nan")}
             for name, value in zip(FEATURE_NAMES, sample.features if sample else [float("nan")] * 4):
                 rec[name] = value
             records.append(rec)
@@ -444,7 +448,13 @@ def evaluate_validation(records: list[dict], cal: GazeCalibrator, ppd: Optional[
     return metrics
 
 
-def record_stimulus(ctx: Ctx, cal: GazeCalibrator, stimulus, args) -> tuple[list[dict], list[dict], dict]:
+def record_stimulus(ctx: Ctx, cal: GazeCalibrator, stimulus, args) -> tuple[list[dict], Letterbox, str]:
+    """Exibe o estímulo e coleta as características brutas de cada frame.
+
+    O olhar, as piscadas e as fixações são calculados depois, em
+    gaze_core.process_recording (permite usar a duração das piscadas e
+    reprocessar a sessão com outros parâmetros).
+    """
     cv2 = ctx.cv2
     if stimulus is not None:
         lb = Letterbox.fit(stimulus.shape[1], stimulus.shape[0], ctx.width, ctx.height)
@@ -459,21 +469,9 @@ def record_stimulus(ctx: Ctx, cal: GazeCalibrator, stimulus, args) -> tuple[list
 
     wait_for_space(ctx, ["Agora sera exibida a tela do teste.", args.task_text or "Observe a tela normalmente."])
 
-    filt = PointFilter(args.filter_min_cutoff, args.filter_beta, enabled=not args.no_filter)
-    idt = IDTFixationDetector(args.fixation_dispersion_px, args.fixation_min_duration_ms, args.fixation_max_gap_ms)
-    rows, fixations = [], []
+    raw_rows: list[dict] = []
     rec_t0 = time.perf_counter()
     stop_reason = "time_limit"
-
-    def add_fix(fix):
-        if fix is None:
-            return
-        sx, sy = lb.screen_to_stimulus(fix.x, fix.y)
-        fixations.append({"fixation_id": fix.fixation_id, "start_ms": fix.start_ms, "end_ms": fix.end_ms,
-                          "duration_ms": fix.duration_ms, "x": fix.x, "y": fix.y, "stim_x": sx, "stim_y": sy,
-                          "samples": fix.samples, "dispersion_px": fix.dispersion_px})
-
-    frame_idx = 0
     try:
         while True:
             elapsed = time.perf_counter() - rec_t0
@@ -481,54 +479,34 @@ def record_stimulus(ctx: Ctx, cal: GazeCalibrator, stimulus, args) -> tuple[list
                 break
             frame = ctx.read()
             sample = ctx.backend.process(frame)
-            t_ms = elapsed * 1000.0
-            valid = sample is not None and not sample.blink
-            raw = filt_xy = (float("nan"), float("nan"))
-            if valid:
-                raw = cal.predict(sample.features)
-                filt_xy = filt(raw[0], raw[1], elapsed)
-            add_fix(idt.add(t_ms, *filt_xy))
-            sx, sy = lb.screen_to_stimulus(*filt_xy)
             feats = sample.features if sample else (float("nan"),) * 4
-            rows.append({
-                "frame_idx": frame_idx, "timestamp_ms": t_ms, "valid": valid,
-                "blink": bool(sample.blink) if sample else False,
-                **dict(zip(FEATURE_NAMES, feats)),
-                "avg_ear": sample.avg_ear if sample else float("nan"),
-                "gaze_raw_x": raw[0], "gaze_raw_y": raw[1], "gaze_x": filt_xy[0], "gaze_y": filt_xy[1],
-                "stim_x": sx, "stim_y": sy, "fixation_id": idt.current_fixation_id,
-            })
+            raw_rows.append({"frame_idx": len(raw_rows), "timestamp_ms": elapsed * 1000.0,
+                             **dict(zip(FEATURE_NAMES, feats)),
+                             "avg_ear": sample.avg_ear if sample else float("nan")})
             canvas = base
-            if args.show_gaze and valid:
+            if args.show_gaze and sample is not None:  # só demonstração (sem filtro)
+                gx, gy = cal.predict(sample.features)
                 canvas = base.copy()
-                cv2.circle(canvas, (int(filt_xy[0]), int(filt_xy[1])), 14, (0, 255, 0), 2, cv2.LINE_AA)
+                cv2.circle(canvas, (int(gx), int(gy)), 14, (0, 255, 0), 2, cv2.LINE_AA)
             ctx.display.show(canvas)
             ctx.display.show_camera(annotate_camera(cv2, frame, sample, "gravacao"))
             if ctx.display.key() in QUIT_KEYS:
                 raise SessionAborted()
-            frame_idx += 1
     except SessionAborted:
         stop_reason = "user_requested_stop"
-    finally:
-        add_fix(idt.flush())
+    return raw_rows, lb, stop_reason
 
-    duration_s = time.perf_counter() - rec_t0
-    n_valid = sum(r["valid"] for r in rows)
-    on_stim = sum(1 for r in rows if r["valid"] and lb.inside_stimulus(r["stim_x"], r["stim_y"]))
-    stats = {
-        "stop_reason": stop_reason,
-        "duration_s": duration_s,
-        "frames": len(rows),
-        "fps": len(rows) / duration_s if duration_s > 0 else float("nan"),
-        "data_loss": 1.0 - n_valid / len(rows) if rows else float("nan"),
-        "blink_frames": sum(r["blink"] for r in rows),
-        "gaze_on_stimulus_ratio": on_stim / n_valid if n_valid else float("nan"),
-        "fixations": len(fixations),
-        "letterbox": lb.to_dict(),
-    }
-    print(f"[gravação] {stats['frames']} frames ({stats['fps']:.1f} fps), perda {stats['data_loss'] * 100:.1f}%, "
-          f"{len(fixations)} fixações")
-    return rows, fixations, stats
+
+def processing_params(args) -> ProcessingParams:
+    return ProcessingParams(
+        filter_enabled=not args.no_filter,
+        filter_min_cutoff=args.filter_min_cutoff,
+        filter_beta=args.filter_beta,
+        dispersion_px=args.fixation_dispersion_px,
+        min_duration_ms=args.fixation_min_duration_ms,
+        max_gap_ms=args.fixation_max_gap_ms,
+        max_blink_ms=args.max_blink_ms,
+    )
 
 
 def write_csv(path: Path, rows: list[dict]) -> None:
@@ -581,6 +559,24 @@ def run_session(args, ctx: Ctx, stimulus) -> dict:
         calib = collect_targets(ctx, "calibration", calib_targets, args.target_seconds,
                                 args.target_settle_seconds, args.target_transition_seconds)
         target_records.extend(calib)
+
+        # Piscadas: 1ª passada com limiar fixo + regra de duração; depois o
+        # limiar passa a depender do olhar vertical (modelo de EAR).
+        static_thr = ctx.backend.blink_threshold if ctx.backend.supports_blink else float("nan")
+        ratio = summary.get("precheck", {}).get("blink_ratio", 0.75)
+        label_target_blinks(calib, static_thr, None, args.max_blink_ms)
+        ear_model = None
+        if ctx.backend.supports_blink:
+            try:
+                ear_model = EarModel(ratio).fit(
+                    [r["target_idx"] for r in calib], [r["eye_y"] for r in calib],
+                    [r["head_y"] for r in calib], [r["avg_ear"] for r in calib])
+                label_target_blinks(calib, static_thr, ear_model, args.max_blink_ms)
+            except ValueError as exc:
+                print(f"[piscada] modelo de EAR não ajustado ({exc}); usando limiar fixo.")
+        summary["blink"] = {"static_threshold": static_thr, "max_blink_ms": args.max_blink_ms,
+                            "ear_model": ear_model.to_dict() if ear_model else None}
+
         cal = fit_calibration(calib, args.calibration_model, args.ridge)
         summary["calibration"] = cal.to_dict()
 
@@ -591,9 +587,16 @@ def run_session(args, ctx: Ctx, stimulus) -> dict:
             val = collect_targets(ctx, "validation", val_targets, args.target_seconds,
                                   args.target_settle_seconds, args.target_transition_seconds)
             target_records.extend(val)
+            label_target_blinks(val, static_thr, ear_model, args.max_blink_ms)
             summary["validation"] = evaluate_validation(val, cal, ppd)
 
-        rows, fixations, stats = record_stimulus(ctx, cal, stimulus, args)
+        raw_rows, lb, stop_reason = record_stimulus(ctx, cal, stimulus, args)
+        rows, fixations, stats = process_recording(raw_rows, cal, static_thr, ear_model, lb,
+                                                   processing_params(args))
+        stats["stop_reason"] = stop_reason
+        print(f"[gravação] {stats['frames']} frames ({stats['fps']:.1f} fps), perda {stats['data_loss'] * 100:.1f}% "
+              f"(piscadas {stats['blink_frames']}, olhar p/ baixo mantido {stats['long_low_ear_frames_kept']}), "
+              f"{stats['fixations']} fixações")
         write_csv(out / "frames.csv", rows)
         write_csv(out / "fixations.csv", fixations)
         summary["recording"] = stats
@@ -657,6 +660,8 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--fixation-dispersion-px", type=float, default=120.0)
     g.add_argument("--fixation-min-duration-ms", type=float, default=100.0)
     g.add_argument("--fixation-max-gap-ms", type=float, default=100.0)
+    g.add_argument("--max-blink-ms", type=float, default=500.0,
+                   help="episódios de EAR baixa mais longos que isso não são piscada (ex.: olhar para baixo)")
     g.add_argument("--show-gaze", action="store_true",
                    help="mostra o cursor do olhar sobre o estímulo (só para demonstração; enviesa testes)")
     return p
