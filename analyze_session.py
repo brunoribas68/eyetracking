@@ -10,8 +10,13 @@ Gera, para uma ou mais sessões, dentro da pasta de saída:
 - model_comparison.csv  (--compare-models: reajusta linear vs. poly2 offline
                          usando os pontos de calibração e avalia nos de validação)
 
+- --reprocess: recalcula piscadas, calibração, validação e fixações a partir
+               dos dados brutos salvos, com o código e os parâmetros atuais
+               (útil para sessões gravadas antes de uma correção).
+
 Uso:
     python analyze_session.py runs/P01 runs/P02 --aois aois.json --out resultados --compare-models
+    python analyze_session.py runs/P01 --reprocess --out resultados
 
 Ou, com uma pasta de estudo (ver estudos/README.md):
     python analyze_session.py --study estudos/f1tv --compare-models
@@ -33,8 +38,9 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from gaze_core import (FEATURE_NAMES, CALIBRATION_MODELS, GazeCalibrator, clean_calibration_samples,
-                       validation_metrics)
+from gaze_core import (FEATURE_NAMES, CALIBRATION_MODELS, EarModel, GazeCalibrator, Letterbox,
+                       ProcessingParams, clean_calibration_samples, label_target_blinks,
+                       process_recording, validation_metrics)
 
 
 def read_csv(path: Path) -> list[dict]:
@@ -107,12 +113,14 @@ def density_map(fixations: list[dict], shape: tuple[int, int], sigma: float) -> 
 
 
 def render_heatmap(stimulus: np.ndarray, density: np.ndarray, min_level: float = 0.05) -> np.ndarray:
-    out = stimulus.copy()
+    # página em cinza esmaecido (como em Bojko) para o calor ficar legível em qualquer site
+    gray = cv2.cvtColor(cv2.cvtColor(stimulus, cv2.COLOR_BGR2GRAY), cv2.COLOR_GRAY2BGR)
+    out = (gray.astype(np.float32) * 0.45 + 70).astype(np.uint8)
     if density.max() <= 0:
         return out
     norm = density / density.max()
     colored = cv2.applyColorMap((norm * 255).astype(np.uint8), cv2.COLORMAP_JET)
-    alpha = np.clip((norm - min_level) / (1 - min_level), 0, 1)[..., None] * 0.65
+    alpha = np.clip((norm - min_level) / (1 - min_level), 0, 1)[..., None] ** 0.6 * 0.75
     out = (out * (1 - alpha) + colored * alpha).astype(np.uint8)
     # legenda simples
     bar = cv2.applyColorMap(np.linspace(255, 0, 150).astype(np.uint8)[:, None].repeat(18, 1), cv2.COLORMAP_JET)
@@ -234,6 +242,74 @@ def compare_models(s: Session, ppd: Optional[float]) -> list[dict]:
     return rows
 
 
+def reprocess(s: Session, args, out_dir: Path) -> None:
+    """Refaz o pipeline a partir de calibration_samples.csv e frames.csv."""
+    meta = s.meta
+    cfg = meta.get("config", {})
+    blink_meta = meta.get("blink") or {}
+    static_thr = blink_meta.get("static_threshold", meta.get("precheck", {}).get("blink_threshold", float("nan")))
+    ratio = meta.get("precheck", {}).get("blink_ratio", 0.75)
+    max_blink = args.max_blink_ms
+    ppd = meta.get("screen", {}).get("px_per_degree")
+
+    calib = [r for r in s.calib if r.get("phase") == "calibration"]
+    val = [r for r in s.calib if r.get("phase") == "validation"]
+    label_target_blinks(calib, static_thr, None, max_blink)
+    ear_model = None
+    if calib and "avg_ear" in calib[0]:
+        try:
+            ear_model = EarModel(ratio).fit([r["target_idx"] for r in calib], [r["eye_y"] for r in calib],
+                                            [r["head_y"] for r in calib], [r["avg_ear"] for r in calib])
+            label_target_blinks(calib, static_thr, ear_model, max_blink)
+        except ValueError:
+            ear_model = None
+    label_target_blinks(val, static_thr, ear_model, max_blink)
+
+    ok = [r for r in calib if r["valid"]]
+    feats, tgts, used = clean_calibration_samples(
+        [int(r["target_idx"]) for r in ok],
+        np.array([[r[n] for n in FEATURE_NAMES] for r in ok], float),
+        np.array([[r["target_x"], r["target_y"]] for r in ok], float))
+    model = args.model or meta.get("calibration", {}).get("model", "poly2")
+    ridge = args.ridge if args.ridge is not None else meta.get("calibration", {}).get("ridge", 1e-2)
+    cal = GazeCalibrator(model, ridge).fit(feats, tgts)
+    meta["calibration"] = {**cal.to_dict(), "targets_used": used}
+
+    per_target: dict = {}
+    for r in val:
+        per_target.setdefault((r["target_x"], r["target_y"]), [])
+        if r["valid"]:
+            per_target[(r["target_x"], r["target_y"])].append(cal.predict([r[n] for n in FEATURE_NAMES]))
+    vm = validation_metrics({k: np.array(v) for k, v in per_target.items()}, ppd)
+    vm["data_loss"] = 1.0 - sum(r["valid"] for r in val) / len(val) if val else float("nan")
+    meta["validation"] = vm
+
+    lb_d = meta.get("recording", {}).get("letterbox")
+    lb = Letterbox(**lb_d) if lb_d else Letterbox.fit(1920, 1080, 1920, 1080)
+    params = ProcessingParams(
+        filter_enabled=not cfg.get("no_filter", False),
+        filter_min_cutoff=cfg.get("filter_min_cutoff", 0.8), filter_beta=cfg.get("filter_beta", 0.005),
+        dispersion_px=args.dispersion_px or cfg.get("fixation_dispersion_px", 120.0),
+        min_duration_ms=cfg.get("fixation_min_duration_ms", 100.0),
+        max_gap_ms=cfg.get("fixation_max_gap_ms", 100.0), max_blink_ms=max_blink)
+    rows, fix_rows, stats = process_recording(s.frames, cal, static_thr, ear_model, lb, params)
+    stats["stop_reason"] = meta.get("recording", {}).get("stop_reason")
+    meta["recording"] = stats
+    meta["blink"] = {"static_threshold": static_thr, "max_blink_ms": max_blink,
+                     "ear_model": ear_model.to_dict() if ear_model else None}
+    meta["reprocessed"] = {"model": model, "ridge": ridge, "dispersion_px": params.dispersion_px}
+    s.fixations = [f for f in fix_rows if math.isfinite(f["stim_x"]) and math.isfinite(f["stim_y"])]
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "session.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_csv(out_dir / "frames.csv", rows)
+    write_csv(out_dir / "fixations.csv", fix_rows)
+    write_csv(out_dir / "calibration_samples.csv", calib + val)
+    print(f"[{s.id}] reprocessado: alvos de calibração={used} | validação {vm['accuracy_mean_px']:.0f}px"
+          + (f" ({vm['accuracy_mean_deg']:.2f}°)" if "accuracy_mean_deg" in vm else "")
+          + f" | perda na gravação {stats['data_loss'] * 100:.1f}% | {stats['fixations']} fixações")
+
+
 # ---------------------------------------------------------------------------
 STUDY_STIMULUS_NAMES = ("estimulo.png", "estimulo.jpg", "estimulo.jpeg", "estimulo.webp")
 
@@ -267,6 +343,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     p.add_argument("--out", type=Path, help="pasta de saída (padrão: resultados/ ou <estudo>/resultados/)")
     p.add_argument("--sigma", type=float, default=40.0, help="desvio da gaussiana do heatmap (px do estímulo)")
     p.add_argument("--compare-models", action="store_true")
+    p.add_argument("--reprocess", action="store_true", help="refaz o pipeline a partir dos dados brutos")
+    p.add_argument("--model", choices=list(CALIBRATION_MODELS), help="(reprocess) modelo de calibração")
+    p.add_argument("--ridge", type=float, help="(reprocess) regularização ridge")
+    p.add_argument("--dispersion-px", type=float, help="(reprocess) limiar de dispersão do I-DT")
+    p.add_argument("--max-blink-ms", type=float, default=500.0, help="(reprocess) duração máxima de piscada")
     args = p.parse_args(argv)
     if args.study is not None:
         resolve_study(args, p)
@@ -287,6 +368,8 @@ def main(argv: Optional[list[str]] = None) -> None:
 
     summaries, aoi_rows, model_rows, all_fix = [], [], [], []
     for s in sessions:
+        if args.reprocess:
+            reprocess(s, args, args.out / "reprocessed" / s.id)
         summaries.append(session_summary(s))
         aoi_rows += aoi_metrics(s, aois)
         all_fix += s.fixations

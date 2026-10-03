@@ -11,7 +11,7 @@ Artificial"* (Especialização em IA Aplicada — UFPR/SEPT).
 |---|---|---|
 | Detecção | rosto + 478 pontos faciais, incluindo íris | MediaPipe Face Mesh (CNN) · fallback Haar/Viola-Jones |
 | Características | posição da íris no olho (x, y) + pose aproximada da cabeça | geometria dos landmarks |
-| Piscada | Eye Aspect Ratio (EAR) com limiar calibrado por pessoa | Soukupová & Čech (2016) |
+| Piscada | EAR com limiar que depende do olhar vertical + episódios > 500 ms não contam (olhar para baixo ≠ piscada) | Soukupová & Čech (2016) |
 | Calibração | 9 alvos em tela cheia → regressão (linear ou polinomial 2º grau, ridge) | aprendizado supervisionado |
 | Validação | 5 alvos **novos** → acurácia e precisão em px e graus | Holmqvist et al. (2012) |
 | Suavização | filtro One Euro | Casiez et al. (2012) |
@@ -69,6 +69,28 @@ na validação).
 Para manter estímulo, AOIs, sessões e resultados juntos, use `estudos/<nome>/`
 (ex.: `estudos/f1tv/`) e rode `python analyze_session.py --study estudos/f1tv`.
 Detalhes em [estudos/README.md](estudos/README.md).
+
+### Reprocessar sessões já gravadas
+
+O olhar, as piscadas e as fixações da gravação são calculados **depois** da coleta
+a partir dos dados brutos salvos. Assim, dá para refazer sessões antigas com o
+código atual ou com outros parâmetros, sem precisar regravar:
+
+```bash
+python analyze_session.py runs/P01 --stimulus estimulos/home.png --aois aois.json --out resultados --reprocess
+python analyze_session.py runs/P01 --reprocess --model linear --dispersion-px 150 --out resultados_linear
+```
+
+Os dados reprocessados ficam em `resultados/reprocessed/<participante>/`.
+
+## Dicas de coleta
+
+- Peça para o participante **mover só os olhos**, sem virar a cabeça (apoiar os
+  cotovelos na mesa ajuda). O movimento de cabeça é hoje a maior fonte de erro.
+- Luz de frente para o rosto, nunca de trás (janela atrás da pessoa = contraluz).
+- A tarefa precisa ter resposta **na página** exibida.
+- AOIs devem ser maiores que o erro do sistema (com ~5° ≈ 190 px, ícones pequenos
+  não são distinguíveis).
 
 ## Testes
 

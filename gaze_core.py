@@ -419,3 +419,197 @@ class Letterbox:
 def grid_points(levels: Iterable[float]) -> list[tuple[float, float]]:
     levels = list(levels)
     return [(x, y) for y in levels for x in levels]
+
+
+# ---------------------------------------------------------------------------
+# piscadas: limiar dependente do olhar + regra de duração
+# ---------------------------------------------------------------------------
+def unflag_long_episodes(t_ms: Sequence[float], low: Sequence[bool], max_blink_ms: float = 500.0,
+                         max_gap_ms: float = 100.0) -> np.ndarray:
+    """Mantém como piscada só os episódios curtos de EAR baixa.
+
+    Uma piscada dura ~100-400 ms. Episódios mais longos são, em geral, o
+    olhar dirigido para baixo (a pálpebra superior acompanha o olho) e não
+    devem ser descartados.
+    """
+    t = np.asarray(t_ms, dtype=float)
+    low = np.asarray(low, dtype=bool)
+    out = low.copy()
+    i, n = 0, len(low)
+    while i < n:
+        if not low[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < n and low[j + 1] and (t[j + 1] - t[j]) <= max_gap_ms:
+            j += 1
+        if t[j] - t[i] > max_blink_ms:
+            out[i:j + 1] = False
+        i = j + 1
+    return out
+
+
+class EarModel:
+    """EAR esperada com olhos abertos em função do olhar vertical e da cabeça.
+
+    Ajustada com as medianas por alvo da calibração (a mediana é robusta às
+    piscadas). Piscada = EAR < ratio * EAR esperada.
+    """
+
+    def __init__(self, ratio: float = 0.75) -> None:
+        self.ratio = ratio
+        self.coef: Optional[np.ndarray] = None
+
+    def fit(self, target_ids, eye_y, head_y, ear) -> "EarModel":
+        ids = np.asarray(target_ids)
+        ey, hy, e = (np.asarray(v, dtype=float) for v in (eye_y, head_y, ear))
+        ok = np.isfinite(ey) & np.isfinite(hy) & np.isfinite(e)
+        rows = []
+        for tid in np.unique(ids[ok]):
+            sel = ok & (ids == tid)
+            if sel.sum() >= 5:
+                rows.append((np.median(ey[sel]), np.median(hy[sel]), np.median(e[sel])))
+        if len(rows) < 4:
+            raise ValueError("alvos insuficientes para o modelo de EAR")
+        a = np.array(rows)
+        x = np.column_stack([np.ones(len(a)), a[:, 0], a[:, 1]])
+        penalty = 1e-6 * np.eye(3)
+        penalty[0, 0] = 0
+        self.coef = np.linalg.solve(x.T @ x + penalty, x.T @ a[:, 2])
+        return self
+
+    def expected(self, eye_y, head_y) -> np.ndarray:
+        return self.coef[0] + self.coef[1] * np.asarray(eye_y, float) + self.coef[2] * np.asarray(head_y, float)
+
+    def thresholds(self, eye_y, head_y) -> np.ndarray:
+        return self.ratio * self.expected(eye_y, head_y)
+
+    def to_dict(self) -> dict:
+        return {"ratio": self.ratio, "coef": None if self.coef is None else self.coef.tolist(),
+                "terms": ["1", "eye_y", "head_y"]}
+
+    @classmethod
+    def from_dict(cls, d: Optional[dict]) -> Optional["EarModel"]:
+        if not d or d.get("coef") is None:
+            return None
+        m = cls(d["ratio"])
+        m.coef = np.asarray(d["coef"], float)
+        return m
+
+
+def low_ear_mask(ear, eye_y, head_y, static_threshold: float, ear_model: Optional[EarModel]) -> np.ndarray:
+    ear = np.asarray(ear, dtype=float)
+    if ear_model is not None:
+        thr = ear_model.thresholds(eye_y, head_y)
+    else:
+        thr = np.full(ear.shape, static_threshold if static_threshold is not None else np.nan, dtype=float)
+    with np.errstate(invalid="ignore"):
+        return np.isfinite(ear) & np.isfinite(thr) & (ear < thr)
+
+
+def _f(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def label_target_blinks(records: list[dict], static_threshold: float, ear_model: Optional[EarModel],
+                        max_blink_ms: float) -> None:
+    """Marca blink/valid nas amostras de calibração/validação (in place), por alvo."""
+    groups: dict = {}
+    for r in records:
+        groups.setdefault((r["phase"], r["target_idx"]), []).append(r)
+    for recs in groups.values():
+        t = [_f(r["timestamp_ms"]) for r in recs]
+        if all("avg_ear" in r and r["avg_ear"] not in ("", None) for r in recs):
+            low = low_ear_mask([_f(r["avg_ear"]) for r in recs], [_f(r["eye_y"]) for r in recs],
+                               [_f(r["head_y"]) for r in recs], static_threshold, ear_model)
+        else:  # sessões antigas sem EAR salva: usa a marcação original
+            low = np.array([r.get("blink") in (True, "True") for r in recs])
+        blink = unflag_long_episodes(t, low, max_blink_ms)
+        for r, b in zip(recs, blink):
+            face = math.isfinite(_f(r["eye_x"]))
+            r["blink"] = bool(b)
+            r["valid"] = bool(face and not b)
+
+
+@dataclass
+class ProcessingParams:
+    filter_enabled: bool = True
+    filter_min_cutoff: float = 0.8
+    filter_beta: float = 0.005
+    dispersion_px: float = 120.0
+    min_duration_ms: float = 100.0
+    max_gap_ms: float = 100.0
+    max_blink_ms: float = 500.0
+
+
+def process_recording(raw_rows: list[dict], cal: GazeCalibrator, static_threshold: float,
+                      ear_model: Optional[EarModel], lb: Letterbox,
+                      p: ProcessingParams) -> tuple[list[dict], list[dict], dict]:
+    """Pós-processa a gravação: piscadas -> olhar -> filtro -> fixações (I-DT).
+
+    Feito depois da coleta para poder usar a duração dos episódios de EAR
+    baixa e para permitir reprocessar sessões com outros parâmetros.
+    """
+    t = np.array([_f(r["timestamp_ms"]) for r in raw_rows])
+    feats = np.array([[_f(r[n]) for n in FEATURE_NAMES] for r in raw_rows]).reshape(-1, 4)
+    ear = np.array([_f(r.get("avg_ear")) for r in raw_rows])
+    face = np.all(np.isfinite(feats), axis=1)
+    low = low_ear_mask(ear, feats[:, 1], feats[:, 3], static_threshold, ear_model)
+    blink = unflag_long_episodes(t, low, p.max_blink_ms)
+    valid = face & ~blink
+
+    filt = PointFilter(p.filter_min_cutoff, p.filter_beta, enabled=p.filter_enabled)
+    idt = IDTFixationDetector(p.dispersion_px, p.min_duration_ms, p.max_gap_ms)
+    fixations: list[Fixation] = []
+    rows = []
+    for i, r in enumerate(raw_rows):
+        raw = (float("nan"), float("nan"))
+        sm = raw
+        if valid[i]:
+            raw = cal.predict(feats[i])
+            sm = filt(raw[0], raw[1], t[i] / 1000.0)
+        fx = idt.add(t[i], *sm)
+        if fx:
+            fixations.append(fx)
+        sx, sy = lb.screen_to_stimulus(*sm)
+        rows.append({
+            "frame_idx": int(_f(r.get("frame_idx", i))), "timestamp_ms": t[i],
+            "face": bool(face[i]), "blink": bool(blink[i]), "valid": bool(valid[i]),
+            **{n: feats[i, k] for k, n in enumerate(FEATURE_NAMES)}, "avg_ear": ear[i],
+            "gaze_raw_x": raw[0], "gaze_raw_y": raw[1], "gaze_x": sm[0], "gaze_y": sm[1],
+            "stim_x": sx, "stim_y": sy, "fixation_id": -1,
+        })
+    last = idt.flush()
+    if last:
+        fixations.append(last)
+
+    fix_rows = []
+    for fx in fixations:
+        sx, sy = lb.screen_to_stimulus(fx.x, fx.y)
+        fix_rows.append({"fixation_id": fx.fixation_id, "start_ms": fx.start_ms, "end_ms": fx.end_ms,
+                         "duration_ms": fx.duration_ms, "x": fx.x, "y": fx.y, "stim_x": sx, "stim_y": sy,
+                         "samples": fx.samples, "dispersion_px": fx.dispersion_px})
+        for row in rows:
+            if fx.start_ms <= row["timestamp_ms"] <= fx.end_ms and row["valid"]:
+                row["fixation_id"] = fx.fixation_id
+
+    n = len(rows)
+    n_valid = int(valid.sum())
+    duration_s = (t[-1] - t[0]) / 1000.0 if n > 1 else 0.0
+    on_stim = sum(1 for r in rows if r["valid"] and lb.inside_stimulus(r["stim_x"], r["stim_y"]))
+    stats = {
+        "duration_s": duration_s,
+        "frames": n,
+        "fps": n / duration_s if duration_s > 0 else float("nan"),
+        "face_loss": 1.0 - face.mean() if n else float("nan"),
+        "blink_frames": int(blink.sum()),
+        "long_low_ear_frames_kept": int((low & ~blink).sum()),
+        "data_loss": 1.0 - n_valid / n if n else float("nan"),
+        "gaze_on_stimulus_ratio": on_stim / n_valid if n_valid else float("nan"),
+        "fixations": len(fix_rows),
+        "letterbox": lb.to_dict(),
+    }
+    return rows, fix_rows, stats

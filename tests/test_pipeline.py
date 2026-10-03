@@ -14,8 +14,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import analyze_session  # noqa: E402
 import eyetracking_ux as et  # noqa: E402
-from gaze_core import (GazeCalibrator, IDTFixationDetector, Letterbox, OneEuroFilter,  # noqa: E402
-                       px_per_degree, robust_mask, validation_metrics)
+from gaze_core import (EarModel, GazeCalibrator, IDTFixationDetector, Letterbox, OneEuroFilter,  # noqa: E402
+                       px_per_degree, robust_mask, unflag_long_episodes, validation_metrics)
 
 W, H = 1600, 900
 
@@ -96,6 +96,25 @@ def test_robust_mask_and_letterbox():
     assert lb.screen_to_stimulus(800, 450) == pytest.approx((500, 500))
 
 
+def test_long_low_ear_episodes_are_not_blinks():
+    t = np.arange(60) * 33.3
+    low = np.zeros(60, bool)
+    low[5:9] = True     # ~100 ms: piscada
+    low[20:50] = True   # ~1 s: olhar para baixo
+    out = unflag_long_episodes(t, low, max_blink_ms=500)
+    assert out[5:9].all() and not out[20:50].any()
+
+
+def test_ear_model_follows_vertical_gaze():
+    ids, ey, hy, ear = [], [], [], []
+    for k, y in enumerate([-0.03, -0.01, 0.01, 0.03]):
+        for _ in range(10):
+            ids.append(k); ey.append(y); hy.append(0.45); ear.append(0.30 - 3.0 * (y + 0.03))
+    m = EarModel(0.75).fit(ids, ey, hy, ear)
+    assert m.expected(-0.03, 0.45) == pytest.approx(0.30, abs=1e-3)
+    assert m.thresholds(0.03, 0.45) == pytest.approx(0.75 * 0.12, abs=1e-3)
+
+
 # --------------------------------------------------------------------------- ponta a ponta
 class FakeCap:
     def read(self):
@@ -149,7 +168,9 @@ class FakeBackend:
             gx, gy = [(0.2 * W, 0.25 * H), (0.75 * W, 0.3 * H), (0.5 * W, 0.8 * H)][k]
         head = (self.rng.gauss(0, 0.01), self.rng.gauss(0, 0.01))
         f = true_features(gx, gy, head, self.rng, 0.002)
-        ear = 0.1 if blink else 0.3 + self.rng.gauss(0, 0.01)
+        # como na sessão real: olhar para baixo fecha a pálpebra (EAR cai)
+        open_ear = 0.32 - 0.18 * (gy / H) ** 2
+        ear = 0.06 if blink else open_ear + self.rng.gauss(0, 0.008)
         return et.GazeSample(f[0], f[1], f[2], f[3], (320, 240), ear < self.blink_threshold, ear)
 
     def close(self):
@@ -171,6 +192,8 @@ def test_full_session_and_analysis(tmp_path):
     summary = et.run_session(args, et.Ctx(cv2, FakeCap(), backend, display, W, H, time.perf_counter()), stimulus)
 
     assert summary["status"] == "saved", summary.get("error")
+    assert summary["calibration"]["n_samples"] > 8 * 20  # nenhuma linha de alvos descartada
+    assert summary["blink"]["ear_model"] is not None
     assert summary["validation"]["accuracy_mean_px"] < 60
     assert 0.0 < summary["recording"]["data_loss"] < 0.2
     assert summary["recording"]["fixations"] >= 3
@@ -200,3 +223,7 @@ def test_full_session_and_analysis(tmp_path):
     analyze_session.main(["--study", str(study)])
     for name in ("heatmap/heatmap_P01.png", "scanpath/scanpath_P01.png", "aois/aoi_metrics.csv"):
         assert (study / "resultados" / name).exists(), name
+
+    res2 = tmp_path / "res2"
+    analyze_session.main([str(out), "--stimulus", str(stim_path), "--out", str(res2), "--reprocess"])
+    assert (res2 / "reprocessed" / "P01" / "fixations.csv").exists()
