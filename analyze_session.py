@@ -1,15 +1,22 @@
 """Análise de sessões gravadas com eyetracking_ux.py.
 
-Gera, para uma ou mais sessões:
-- heatmap_<participante>.png e scanpath_<participante>.png
-- group_heatmap.png (todas as sessões somadas, como nos mapas de Bojko)
-- summary.csv      (qualidade dos dados + estatísticas de fixação por sessão)
-- aoi_metrics.csv  (TTFF, nº de fixações, tempo de permanência, visitas por AOI)
-- model_comparison.csv (--compare-models: reajusta linear vs. poly2 offline
-                        usando os pontos de calibração e avalia nos de validação)
+Gera, para uma ou mais sessões, dentro da pasta de saída:
+- heatmap/heatmap_<participante>.png e heatmap/group_heatmap.png
+  (todas as sessões somadas, como nos mapas de Bojko)
+- scanpath/scanpath_<participante>.png
+- aois/aois.png         (as AOIs desenhadas sobre o estímulo, para conferência)
+- aois/aoi_metrics.csv  (TTFF, nº de fixações, tempo de permanência, visitas por AOI)
+- summary.csv           (qualidade dos dados + estatísticas de fixação por sessão)
+- model_comparison.csv  (--compare-models: reajusta linear vs. poly2 offline
+                         usando os pontos de calibração e avalia nos de validação)
 
 Uso:
     python analyze_session.py runs/P01 runs/P02 --aois aois.json --out resultados --compare-models
+
+Ou, com uma pasta de estudo (ver estudos/README.md):
+    python analyze_session.py --study estudos/f1tv --compare-models
+que usa estudos/f1tv/estimulo.png, estudos/f1tv/aois.json, todas as sessões em
+estudos/f1tv/sessoes/ e grava em estudos/f1tv/resultados/.
 
 Formato do aois.json (coordenadas em pixels da imagem do estímulo):
     [{"name": "menu", "x": 20, "y": 80, "w": 160, "h": 220}, ...]
@@ -228,37 +235,71 @@ def compare_models(s: Session, ppd: Optional[float]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+STUDY_STIMULUS_NAMES = ("estimulo.png", "estimulo.jpg", "estimulo.jpeg", "estimulo.webp")
+
+
+def resolve_study(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Preenche sessões, estímulo, AOIs e saída a partir de uma pasta de estudo.
+
+    Valores passados explicitamente na linha de comando têm prioridade.
+    """
+    study: Path = args.study
+    if not study.is_dir():
+        parser.error(f"pasta de estudo não encontrada: {study}")
+    if not args.sessions:
+        args.sessions = sorted(d for d in (study / "sessoes").glob("*") if (d / "session.json").exists())
+        if not args.sessions:
+            parser.error(f"nenhuma sessão em {study / 'sessoes'} (grave com --output-dir {study / 'sessoes'}/P01)")
+    if args.stimulus is None:
+        args.stimulus = next((study / n for n in STUDY_STIMULUS_NAMES if (study / n).exists()), None)
+    if args.aois is None and (study / "aois.json").exists():
+        args.aois = study / "aois.json"
+    if args.out is None:
+        args.out = study / "resultados"
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     p = argparse.ArgumentParser(description="Análise de sessões de eye tracking")
-    p.add_argument("sessions", nargs="+", type=Path)
+    p.add_argument("sessions", nargs="*", type=Path)
+    p.add_argument("--study", type=Path, help="pasta de estudo (estimulo.png, aois.json, sessoes/, resultados/)")
     p.add_argument("--stimulus", type=Path)
     p.add_argument("--aois", type=Path)
-    p.add_argument("--out", type=Path, default=Path("resultados"))
+    p.add_argument("--out", type=Path, help="pasta de saída (padrão: resultados/ ou <estudo>/resultados/)")
     p.add_argument("--sigma", type=float, default=40.0, help="desvio da gaussiana do heatmap (px do estímulo)")
     p.add_argument("--compare-models", action="store_true")
     args = p.parse_args(argv)
+    if args.study is not None:
+        resolve_study(args, p)
+    if not args.sessions:
+        p.error("informe as pastas das sessões ou --study")
+    if args.out is None:
+        args.out = Path("resultados")
 
     sessions = [Session(d) for d in args.sessions]
-    args.out.mkdir(parents=True, exist_ok=True)
+    heat_dir, scan_dir, aoi_dir = args.out / "heatmap", args.out / "scanpath", args.out / "aois"
+    for d in (heat_dir, scan_dir, aoi_dir):
+        d.mkdir(parents=True, exist_ok=True)
     stimulus = load_stimulus(sessions, args.stimulus)
     aois = json.loads(args.aois.read_text(encoding="utf-8")) if args.aois else []
     h, w = stimulus.shape[:2]
+    if aois:
+        cv2.imwrite(str(aoi_dir / "aois.png"), render_scanpath(stimulus, [], aois))
 
     summaries, aoi_rows, model_rows, all_fix = [], [], [], []
     for s in sessions:
         summaries.append(session_summary(s))
         aoi_rows += aoi_metrics(s, aois)
         all_fix += s.fixations
-        cv2.imwrite(str(args.out / f"heatmap_{s.id}.png"),
+        cv2.imwrite(str(heat_dir / f"heatmap_{s.id}.png"),
                     render_heatmap(stimulus, density_map(s.fixations, (h, w), args.sigma)))
-        cv2.imwrite(str(args.out / f"scanpath_{s.id}.png"), render_scanpath(stimulus, s.fixations, aois))
+        cv2.imwrite(str(scan_dir / f"scanpath_{s.id}.png"), render_scanpath(stimulus, s.fixations, aois))
         if args.compare_models:
             model_rows += compare_models(s, s.meta.get("screen", {}).get("px_per_degree"))
 
-    cv2.imwrite(str(args.out / "group_heatmap.png"),
+    cv2.imwrite(str(heat_dir / "group_heatmap.png"),
                 render_heatmap(stimulus, density_map(all_fix, (h, w), args.sigma)))
     write_csv(args.out / "summary.csv", summaries)
-    write_csv(args.out / "aoi_metrics.csv", aoi_rows)
+    write_csv(aoi_dir / "aoi_metrics.csv", aoi_rows)
     write_csv(args.out / "model_comparison.csv", model_rows)
 
     acc = [r["val_accuracy_px"] for r in summaries if isinstance(r["val_accuracy_px"], (int, float))]
