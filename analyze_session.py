@@ -35,6 +35,7 @@ import numpy as np
 
 from gaze_core import (FEATURE_NAMES, CALIBRATION_MODELS, GazeCalibrator, clean_calibration_samples,
                        validation_metrics)
+from web_stimulus import PageSnapshot, aois_in_view, load_snapshot_for
 
 
 def read_csv(path: Path) -> list[dict]:
@@ -77,8 +78,20 @@ class Session:
         self.id = str(self.meta.get("participant") or path.name)
 
 
+def stimulus_path(sessions: list[Session], override: Optional[Path]) -> Optional[Path]:
+    return override or (Path(sessions[0].meta["stimulus"]) if sessions[0].meta.get("stimulus") else None)
+
+
+def page_snapshot(sessions: list[Session], stimulus: Optional[Path]) -> Optional[PageSnapshot]:
+    """Captura do site usada como estímulo: arquivo lateral do png ou cópia no session.json."""
+    snap = load_snapshot_for(stimulus) if stimulus is not None else None
+    if snap is None and sessions[0].meta.get("stimulus_page"):
+        snap = PageSnapshot.from_dict(sessions[0].meta["stimulus_page"])
+    return snap
+
+
 def load_stimulus(sessions: list[Session], override: Optional[Path]) -> np.ndarray:
-    path = override or (Path(sessions[0].meta["stimulus"]) if sessions[0].meta.get("stimulus") else None)
+    path = stimulus_path(sessions, override)
     if path is not None:
         img = cv2.imread(str(path))
         if img is None:
@@ -281,6 +294,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         d.mkdir(parents=True, exist_ok=True)
     stimulus = load_stimulus(sessions, args.stimulus)
     aois = json.loads(args.aois.read_text(encoding="utf-8")) if args.aois else []
+    aois = aois_in_view(aois, page_snapshot(sessions, stimulus_path(sessions, args.stimulus)))
     h, w = stimulus.shape[:2]
     if aois:
         cv2.imwrite(str(aoi_dir / "aois.png"), render_scanpath(stimulus, [], aois))

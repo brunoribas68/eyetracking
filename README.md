@@ -70,6 +70,14 @@ Para manter estímulo, AOIs, sessões e resultados juntos, use `estudos/<nome>/`
 (ex.: `estudos/f1tv/`) e rode `python analyze_session.py --study estudos/f1tv`.
 Detalhes em [estudos/README.md](estudos/README.md).
 
+### Site como estímulo
+
+Em vez de um print feito à mão, o estímulo pode ser um site: `--url https://...`
+na gravação, ou um `site.json` na pasta do estudo. A página é capturada no
+tamanho da tela (Playwright/Chromium) e as AOIs podem ser seletores CSS
+(`{"name": "busca", "selector": "#search"}`). Requer `pip install playwright`.
+Ver [estudos/README.md](estudos/README.md#usando-um-site-em-vez-de-imagem).
+
 ## Testes
 
 ```bash

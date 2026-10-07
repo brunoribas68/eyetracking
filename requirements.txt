@@ -3,3 +3,5 @@ numpy>=1.24
 # Opcional (recomendado, mais preciso): MediaPipe Face Mesh com íris.
 # Use uma versão que ainda traga a API "solutions", ex.:
 #   pip install "mediapipe==0.10.14"
+# Opcional: usar um site como estímulo (web_stimulus.py / --url / site.json):
+#   pip install playwright && playwright install chromium

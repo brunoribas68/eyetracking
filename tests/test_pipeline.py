@@ -200,3 +200,54 @@ def test_full_session_and_analysis(tmp_path):
     analyze_session.main(["--study", str(study)])
     for name in ("heatmap/heatmap_P01.png", "scanpath/scanpath_P01.png", "aois/aoi_metrics.csv"):
         assert (study / "resultados" / name).exists(), name
+
+
+# ---------------------------------------------------------------------------
+# site como estímulo
+# ---------------------------------------------------------------------------
+import web_stimulus as ws  # noqa: E402
+
+
+def test_page_view_coordinates_and_aoi_resolution():
+    view = ws.PageView(url="https://x", scroll_y=500, viewport_w=800, viewport_h=600, page_h=3000)
+    assert view.view_to_page(10, 20) == (10, 520)
+    assert view.page_to_view(*view.view_to_page(10, 20)) == (10, 20)
+    assert view.box_to_view({"x": 0, "y": 0, "w": 100, "h": 100}) is None          # acima da dobra
+    assert view.box_to_view({"x": 0, "y": 450, "w": 100, "h": 100}) == {"x": 0.0, "y": 0.0, "w": 100.0, "h": 50.0}
+
+    snap = ws.PageSnapshot(view=view, aois=[{"name": "menu", "selector": "nav", "x": 0, "y": 600, "w": 800, "h": 60},
+                                            {"name": "sumiu", "selector": "#x", "missing": True}])
+    snap = ws.PageSnapshot.from_dict(json.loads(json.dumps(snap.to_dict())))
+    aois = ws.aois_in_view([{"name": "menu", "selector": "nav"}, {"name": "sumiu", "selector": "#x"},
+                            {"name": "manual", "x": 1, "y": 2, "w": 3, "h": 4}], snap)
+    assert [a["name"] for a in aois] == ["menu", "manual"]
+    assert (aois[0]["y"], aois[0]["h"]) == (100, 60)
+    assert ws.aois_in_view([{"name": "menu", "selector": "nav"}], None) == []
+
+
+def _browser_available() -> bool:
+    try:
+        with ws.open_browser():
+            return True
+    except BaseException:
+        return False
+
+
+@pytest.mark.skipif(not _browser_available(), reason="playwright/chromium indisponível")
+def test_capture_local_page(tmp_path):
+    html = tmp_path / "p.html"
+    html.write_text('<body style="margin:0"><nav id="menu" style="height:60px;background:#222"></nav>'
+                    '<div class="hero" style="margin:40px;width:400px;height:200px;background:red"></div></body>')
+    study = tmp_path / "estudo"
+    study.mkdir()
+    (study / "site.json").write_text(json.dumps({"url": html.as_uri(), "viewport": "800x600", "wait_ms": 50}))
+    (study / "aois.json").write_text(json.dumps([{"name": "menu", "selector": "#menu"},
+                                                 {"name": "hero", "selector": ".hero"}]))
+    snap = ws.capture_study(study)
+    import cv2
+    assert cv2.imread(str(study / "estimulo.png")).shape[:2] == (600, 800)
+    boxes = {a["name"]: a for a in ws.aois_in_view(json.loads((study / "aois.json").read_text()),
+                                                   ws.load_snapshot_for(study / "estimulo.png"))}
+    assert (boxes["menu"]["w"], boxes["menu"]["h"]) == (800, 60)
+    assert (boxes["hero"]["x"], boxes["hero"]["y"]) == (40, 100)
+    assert snap.view.url == html.as_uri()

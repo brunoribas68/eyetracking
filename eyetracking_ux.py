@@ -556,6 +556,7 @@ def run_session(args, ctx: Ctx, stimulus) -> dict:
         "screen": {"width_px": ctx.width, "height_px": ctx.height, "width_cm": args.screen_width_cm,
                    "distance_cm": args.distance_cm, "px_per_degree": ppd},
         "stimulus": str(args.stimulus) if args.stimulus else None,
+        "stimulus_page": getattr(args, "stimulus_page", None),
         "task_text": args.task_text,
         "config": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
         "environment": {"python": sys.version.split()[0], "platform": platform.platform(),
@@ -627,9 +628,14 @@ def detect_screen_size(default: tuple[int, int]) -> tuple[int, int]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Eye tracking por webcam para estudos de UX")
     g = p.add_argument_group("sessão")
-    g.add_argument("--output-dir", type=Path, default=Path("runs/sessao"))
+    g.add_argument("--output-dir", type=Path,
+                   help="pasta da sessão (padrão: <estudo>/sessoes/<participante> ou runs/sessao)")
     g.add_argument("--participant", default="P00", help="identificador anônimo do participante")
+    g.add_argument("--study", type=Path, help="pasta de estudo (estimulo.png, site.json, aois.json, sessoes/)")
     g.add_argument("--stimulus", type=Path, help="imagem exibida na gravação (ex.: print de um site)")
+    g.add_argument("--url", help="site usado como estímulo: é capturado na resolução da tela antes do teste")
+    g.add_argument("--recapture", action="store_true",
+                   help="com --study e site.json: captura o site de novo mesmo se estimulo.png já existir")
     g.add_argument("--task-text", default="", help="instrução da tarefa exibida antes do estímulo")
     g.add_argument("--max-session-seconds", type=float, default=30.0, help="0 = até apertar Q")
     g.add_argument("--seed", type=int, default=42)
@@ -662,6 +668,44 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def resolve_stimulus(args, width: int, height: int) -> None:
+    """Define pasta de saída e estímulo a partir de --study/--url/--stimulus.
+
+    Com site (--url ou site.json do estudo) o print é tirado no tamanho da tela,
+    para o participante ver a página como num navegador em tela cheia.
+    """
+    if args.study is not None:
+        if args.output_dir is None:
+            args.output_dir = args.study / "sessoes" / args.participant
+        if args.stimulus is None:
+            args.stimulus = args.study / "estimulo.png"
+        if args.url is None and (args.study / "site.json").exists() and (args.recapture or not args.stimulus.exists()):
+            import web_stimulus
+
+            print("Capturando o site do estudo...")
+            web_stimulus.capture_study(args.study, (width, height), args.stimulus)
+    if args.output_dir is None:
+        args.output_dir = Path("runs/sessao")
+    if args.url:
+        import web_stimulus
+
+        if args.stimulus is None:
+            args.stimulus = args.output_dir / "estimulo.png"
+        aois_path = args.study / "aois.json" if args.study else None
+        aois = json.loads(aois_path.read_text(encoding="utf-8")) if aois_path and aois_path.exists() else []
+        print(f"Capturando {args.url} em {width}x{height}...")
+        web_stimulus.capture(args.url, args.stimulus, (width, height), aois)
+    if args.stimulus is not None:
+        import web_stimulus
+
+        snap = web_stimulus.load_snapshot_for(args.stimulus)
+        if snap is not None:
+            args.stimulus_page = snap.to_dict()
+            if (snap.view.viewport_w, snap.view.viewport_h) != (width, height) and not snap.full_page:
+                print(f"[aviso] o print do site foi tirado em {snap.view.viewport_w}x{snap.view.viewport_h}, "
+                      f"mas a tela é {width}x{height}; use --recapture para refazer no tamanho da tela")
+
+
 def main(argv: Optional[list[str]] = None) -> None:
     args = build_parser().parse_args(argv)
     import cv2
@@ -670,6 +714,7 @@ def main(argv: Optional[list[str]] = None) -> None:
         width, height = (int(v) for v in args.screen_size.lower().split("x"))
     else:
         width, height = detect_screen_size((1920, 1080))
+    resolve_stimulus(args, width, height)
 
     stimulus = None
     if args.stimulus:
